@@ -3,8 +3,9 @@
 //! path → entry lookup for applying directory-watch events.
 //!
 //! Never opens a file: names, folder bit and modified time come from the
-//! directory listing. Reparse points (junctions, symlinks) are listed but
-//! not followed, so link loops cannot recurse.
+//! directory listing. Links (junctions, symlinks) are listed but not
+//! followed, so link loops cannot recurse. Other reparse points are real
+//! folders and are walked: OneDrive's cloud-file folders are one.
 
 use crate::volindex::FrnMap;
 use flint_core::{EntryId, EntryInput, Index};
@@ -12,8 +13,6 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
-
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WalkStats {
@@ -135,14 +134,11 @@ fn is_dir(md: &std::fs::Metadata) -> bool {
     md.is_dir()
 }
 
-#[cfg(windows)]
+/// A link to another place: a junction or symlink. On Windows this is a
+/// reparse point whose tag is a name surrogate; a reparse point of any
+/// other kind (a OneDrive cloud-file folder, a deduplicated file) is the
+/// real item and is walked like any folder.
 fn is_link(md: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-#[cfg(not(windows))]
-fn is_link(md: &std::fs::Metadata) -> bool {
-    let _ = FILE_ATTRIBUTE_REPARSE_POINT;
     md.file_type().is_symlink()
 }
 
@@ -477,6 +473,78 @@ pub(crate) mod tests {
         // walking again finds the same entries, no duplicates
         walk(&mut ix, &mut map, &d, |_| {});
         assert_eq!(paths_under(&ix, &d), p);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Marks folder `d` as a reparse point with a third-party tag that is
+    /// not a name surrogate: the kind OneDrive's cloud-file folders are.
+    /// No admin rights needed. `false` when the volume refused it.
+    fn mark_reparse_not_link(d: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+        let w: Vec<u16> = d.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: w is a NUL-terminated path; the handle is closed below.
+        let h = unsafe {
+            CreateFileW(
+                w.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        // REPARSE_GUID_DATA_BUFFER: tag 0x99 (not Microsoft's, not a name
+        // surrogate), 4 data bytes, any GUID
+        let mut buf = Vec::new();
+        buf.extend(0x99u32.to_le_bytes());
+        buf.extend(4u16.to_le_bytes());
+        buf.extend(0u16.to_le_bytes());
+        buf.extend([7u8; 16]);
+        buf.extend([1u8, 2, 3, 4]);
+        let mut n = 0u32;
+        // SAFETY: buf is a complete reparse buffer of the given length.
+        let ok = unsafe {
+            DeviceIoControl(
+                h,
+                FSCTL_SET_REPARSE_POINT,
+                buf.as_ptr().cast(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut n,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        // SAFETY: h is our open handle.
+        unsafe { CloseHandle(h) };
+        ok
+    }
+
+    /// OneDrive's folders are reparse points (cloud files) but real
+    /// folders: skipping every reparse point left all of OneDrive out.
+    #[test]
+    fn walk_enters_a_reparse_folder_that_is_not_a_link() {
+        let d = tmp("cloud");
+        std::fs::create_dir_all(d.join("cloud")).unwrap();
+        assert!(mark_reparse_not_link(&d.join("cloud")), "reparse tag set");
+        let mut ix = Index::new();
+        let mut map = PathMap::new();
+        let s = walk(&mut ix, &mut map, &d, |_| {});
+        // no filter handles tag 0x99 here, so opening it fails: what
+        // matters is that the walk tried, instead of calling it a link
+        assert_eq!(s.links_skipped, 0, "not a link");
+        assert_eq!(s.unreadable_dirs, 1, "walked into");
         let _ = std::fs::remove_dir_all(&d);
     }
 
