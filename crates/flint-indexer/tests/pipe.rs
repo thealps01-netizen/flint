@@ -270,6 +270,16 @@ fn user_mode_refuses_another_sid() {
 }
 
 #[test]
+fn a_cancel_with_nothing_in_flight_still_closes_the_connection() {
+    // the server's stop cancels each connection; one between two reads
+    // (nothing in flight) must not go on serving
+    let (name, _s, _h) = start(small_index());
+    let c = Client::connect(&name, &me()).unwrap();
+    c.conn.cancel();
+    assert!(c.query("rapor", 5, vec![]).is_err(), "closed after cancel");
+}
+
+#[test]
 fn stopping_the_server_ends_open_connections() {
     let (name, _s, h) = start(small_index());
     let c = Client::connect(&name, &me()).unwrap();

@@ -7,7 +7,7 @@ use crate::server::Conn;
 use crate::volume::Handle;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use windows_sys::Win32::Foundation::{
@@ -233,6 +233,15 @@ pub struct PipeConn {
     wr: Mutex<Handle>,
     /// Read timeout in ms (`INFINITE` = none).
     read_timeout: AtomicU32,
+    /// Set by [`PipeConn::cancel`]: no further read or write starts.
+    closed: AtomicBool,
+}
+
+fn closed_err() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "the connection was closed",
+    )
 }
 
 fn io_err_eof(e: io::Error) -> io::Error {
@@ -254,12 +263,16 @@ impl PipeConn {
             rd: Mutex::new(event()?),
             wr: Mutex::new(event()?),
             read_timeout: AtomicU32::new(INFINITE),
+            closed: AtomicBool::new(false),
         })
     }
 
     /// One overlapped ReadFile/WriteFile, waited for before returning (so
     /// the OVERLAPPED and the buffer outlive the request).
     fn transfer(&self, ev: &Handle, read: bool, ptr: *mut u8, len: u32) -> io::Result<usize> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(closed_err());
+        }
         // SAFETY: zeroed OVERLAPPED is valid; its event is ours.
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
         ov.hEvent = ev.raw();
@@ -277,6 +290,17 @@ impl PipeConn {
             return Err(io_err_eof(io::Error::last_os_error()));
         }
         let mut n = 0u32;
+        // a cancel between the check above and this request found nothing
+        // in flight: it is seen here, and this request is cancelled
+        if self.closed.load(Ordering::SeqCst) {
+            // SAFETY: cancels the request issued above, then waits for it to
+            // end, so the buffer and OVERLAPPED outlive it.
+            unsafe {
+                CancelIoEx(self.h.raw(), &ov);
+                GetOverlappedResult(self.h.raw(), &ov, &mut n, 1);
+            }
+            return Err(closed_err());
+        }
         let limit = if read {
             self.read_timeout.load(Ordering::Relaxed)
         } else {
@@ -317,8 +341,11 @@ impl PipeConn {
         Ok(())
     }
 
-    /// Wakes every pending read/write on this pipe with an error.
+    /// Closes the connection: every pending read/write ends with an error
+    /// and no later one starts (also when nothing was in flight).
     pub fn cancel(&self) {
+        // set before the cancel, so a request issued after it sees the flag
+        self.closed.store(true, Ordering::SeqCst);
         // SAFETY: cancels I/O on our own handle; null = every request.
         unsafe { CancelIoEx(self.h.raw(), std::ptr::null()) };
     }
