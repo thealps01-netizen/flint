@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn details_of_missing_is_none() {
         assert_eq!(
-            details(&tmp("missing").join("yok.txt").to_string_lossy()),
+            details(&tmp("details-missing").join("yok.txt").to_string_lossy()),
             None
         );
     }
