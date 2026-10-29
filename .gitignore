@@ -1,0 +1,6 @@
+target/
+node_modules/
+dist/
+*.log
+crates/flint-app/gen/
+crates/flint-app/installer/bin/

@@ -1,0 +1,106 @@
+# Builds a release when a version tag (v0.1.0, …) is pushed: the signed
+# installer, its signature and the update manifest, attached to a DRAFT
+# GitHub release. A person reviews and publishes the draft; only then do
+# installed copies see the update.
+#
+# Needs, in the repository settings:
+#   secret   TAURI_SIGNING_PRIVATE_KEY           the release signing key (tauri signer generate)
+#   secret   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password
+#   variable FLINT_UPDATE_PUBKEY                 the key's public half (the .pub file's text)
+# Losing the private key means installed copies can no longer be updated.
+# A tag with a pre-release part (v0.2.0-rc.1) makes a pre-release, which
+# installed copies do not see (they read the latest full release).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/flint-app/ui/package-lock.json
+
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: The tag matches the version in Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq "flint-app" | Select-Object -ExpandProperty version
+          if ("v$version" -ne $env:TAG) {
+            throw "tag $env:TAG does not match flint-app $version"
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Install UI dependencies
+        run: npm --prefix crates/flint-app/ui ci
+
+      # each command's exit code is checked: a step only fails on its
+      # last command's code otherwise
+      - name: Tests
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = "Stop"
+          npm --prefix crates/flint-app/ui run build
+          cargo test --workspace --release
+          npm --prefix crates/flint-app/ui test
+          node scripts/check-claims.mjs
+
+      - name: Signed installer with the update address
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          PUBKEY: ${{ vars.FLINT_UPDATE_PUBKEY }}
+          MANIFEST_URL: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+        run: |
+          $env:PUBKEY = "$env:PUBKEY".Trim()
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:PUBKEY) {
+            throw "the signing key secret or the FLINT_UPDATE_PUBKEY variable is not set"
+          }
+          $conf = @{
+            bundle  = @{ createUpdaterArtifacts = $true }
+            plugins = @{ updater = @{ pubkey = $env:PUBKEY; endpoints = @($env:MANIFEST_URL) } }
+          } | ConvertTo-Json -Depth 5
+          Set-Content -Path "$env:RUNNER_TEMP/release.conf.json" -Value $conf -Encoding utf8
+          Push-Location crates/flint-app
+          npx --prefix ui tauri build --config "$env:RUNNER_TEMP/release.conf.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+
+      - name: Update manifest
+        shell: pwsh
+        run: |
+          $setup = "target/release/bundle/nsis/Flint_${env:VERSION}_x64-setup.exe"
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          node scripts/update-manifest.mjs $setup $env:VERSION $base > target/release/bundle/nsis/latest.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dir = "target/release/bundle/nsis"
+          $pre = if ($env:VERSION.Contains("-")) { @("--prerelease") } else { @() }
+          gh release create $env:TAG --draft @pre --title "Flint $env:VERSION" `
+            --notes "See CHANGELOG.md for what changed. The installer is not code-signed: Windows SmartScreen may warn on download." `
+            "$dir/Flint_${env:VERSION}_x64-setup.exe" "$dir/Flint_${env:VERSION}_x64-setup.exe.sig" "$dir/latest.json"

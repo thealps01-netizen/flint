@@ -1,0 +1,78 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Flint",
+  "identifier": "app.flint.launcher",
+  "build": {
+    "frontendDist": "ui/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "node ../scripts/prepare-indexer.mjs"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "launcher",
+        "title": "Flint",
+        "url": "index.html",
+        "width": 860,
+        "height": 624,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "shadow": false,
+        "focus": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' flinticon: http://flinticon.localhost data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "Flint contributors",
+    "copyright": "Copyright (c) 2026 Flint contributors",
+    "license": "MIT",
+    "shortDescription": "Find a file by part of its name and open it",
+    "icon": [
+      "icons/icon.ico",
+      "icons/32x32.png",
+      "icons/128x128.png"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "installer/hooks.nsh",
+        "startMenuFolder": "Flint",
+        "languages": [
+          "English",
+          "Turkish"
+        ]
+      }
+    }
+  },
+  "mainBinaryName": "flint",
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

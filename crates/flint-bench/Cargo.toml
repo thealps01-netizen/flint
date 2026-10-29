@@ -1,0 +1,12 @@
+[package]
+name = "flint-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+flint-core = { version = "0.1.0", path = "../flint-core" }
+flint-indexer = { version = "0.1.0", path = "../flint-indexer" }
+rand = "0.10.3"
+rand_chacha = "0.10.0"
+rayon = "1.12.0"

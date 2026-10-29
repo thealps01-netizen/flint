@@ -1,0 +1,66 @@
+/* Colour tokens shared by the launcher and Settings. Dark is the
+   canon; light is the same design in daylight values. The theme follows Windows
+   (prefers-color-scheme) unless Settings sets data-theme. */
+:root {
+  --surface: rgba(28, 28, 34, .88);
+  --surface-solid: #1C1C22;
+  --edge: rgba(255, 255, 255, .12);
+  --line: rgba(255, 255, 255, .08);
+  --line-soft: rgba(255, 255, 255, .05);
+  --text: #F2F2F5;
+  --text-2: #E4E4EE;
+  --muted: #9C9CB2;
+  --icon: #A9A9BF;
+  --accent: #7C5CFF;
+  --caret: #9C85FF;
+  --match: #B9A9FF;
+  --sel: rgba(124, 92, 255, .24);
+  --sel-edge: rgba(156, 133, 255, .35);
+  --sel-muted: #B8B4D6;
+  --sel-strong: #E4E1F5;
+  --key-bg: rgba(255, 255, 255, .09);
+  --key-edge: rgba(255, 255, 255, .1);
+  --key-text: #B4B4C8;
+  --hover: rgba(255, 255, 255, .07);
+  --foot: rgba(10, 10, 16, .28);
+  --banner: rgba(124, 92, 255, .14);
+  --warn: rgba(255, 170, 90, .14);
+  --warn-text: #FFD2A8;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --surface: rgba(246, 246, 250, .86);
+    --surface-solid: #F3F3F7;
+    --edge: rgba(0, 0, 0, .12);
+    --line: rgba(0, 0, 0, .08);
+    --line-soft: rgba(0, 0, 0, .05);
+    --text: #18181E;
+    --text-2: #26262E;
+    --muted: #5E5E72;
+    --icon: #5E5E72;
+    --caret: #6A48F0;
+    --match: #5532D6;
+    --sel: rgba(124, 92, 255, .16);
+    --sel-edge: rgba(124, 92, 255, .38);
+    --sel-muted: #4D4A6A;
+    --sel-strong: #2B2840;
+    --key-bg: rgba(0, 0, 0, .05);
+    --key-edge: rgba(0, 0, 0, .1);
+    --key-text: #4A4A5C;
+    --hover: rgba(0, 0, 0, .05);
+    --foot: rgba(0, 0, 0, .035);
+    --banner: rgba(124, 92, 255, .1);
+    --warn: rgba(230, 120, 20, .12);
+    --warn-text: #7A3A00;
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --surface: rgba(246, 246, 250, .86); --surface-solid: #F3F3F7; --edge: rgba(0, 0, 0, .12);
+  --line: rgba(0, 0, 0, .08); --line-soft: rgba(0, 0, 0, .05); --text: #18181E; --text-2: #26262E;
+  --muted: #5E5E72; --icon: #5E5E72; --caret: #6A48F0; --match: #5532D6; --sel: rgba(124, 92, 255, .16);
+  --sel-edge: rgba(124, 92, 255, .38); --sel-muted: #4D4A6A; --sel-strong: #2B2840; --key-bg: rgba(0, 0, 0, .05);
+  --key-edge: rgba(0, 0, 0, .1); --key-text: #4A4A5C; --hover: rgba(0, 0, 0, .05); --foot: rgba(0, 0, 0, .035);
+  --banner: rgba(124, 92, 255, .1); --warn: rgba(230, 120, 20, .12); --warn-text: #7A3A00; color-scheme: light;
+}

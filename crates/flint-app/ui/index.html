@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Flint</title>
+    <link rel="stylesheet" href="/src/app.css" />
+  </head>
+  <body>
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+      <defs>
+        <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" /><path d="M16 16l4.5 4.5" /></symbol>
+        <symbol id="i-open" viewBox="0 0 24 24"><path d="M8 16L17 7M9 7h8v8" /></symbol>
+        <symbol id="i-folder-open" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1H7.5a2 2 0 0 0-1.9 1.4L3.5 17M3 17l2.6-6.6A1.5 1.5 0 0 1 7 9.5h13.5a1 1 0 0 1 1 1.3L19.5 17a2 2 0 0 1-2 1.5H5a2 2 0 0 1-2-1.5z" /></symbol>
+        <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2" /><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" /></symbol>
+        <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z" /></symbol>
+      </defs>
+    </svg>
+    <main class="win" id="win">
+      <div class="sb">
+        <svg class="i" aria-hidden="true"><use href="#i-search" /></svg>
+        <input id="q" type="text" spellcheck="false" autocomplete="off" role="combobox"
+          aria-autocomplete="list" aria-expanded="false" aria-controls="list" />
+        <span class="k" id="k-esc">Esc</span>
+      </div>
+      <div class="st" id="status" aria-live="polite"></div>
+      <div class="bn" id="banner" hidden></div>
+      <div class="bd">
+        <div class="ls" id="list" role="listbox"></div>
+        <aside class="dt" id="details" hidden>
+          <div id="detail-body"></div>
+          <div class="ac">
+            <button class="a pr" id="act-open" type="button"><svg class="i"><use href="#i-open" /></svg><span data-t="open"></span><span class="k">Enter</span></button>
+            <button class="a" id="act-reveal" type="button"><svg class="i"><use href="#i-folder-open" /></svg><span data-t="reveal"></span><span class="k">Ctrl+Enter</span></button>
+            <button class="a" id="act-copy" type="button"><svg class="i"><use href="#i-copy" /></svg><span data-t="copy"></span><span class="k">Ctrl+C</span></button>
+          </div>
+        </aside>
+      </div>
+      <div class="ft">
+        <span><span class="k">Enter</span><span data-t="open"></span></span>
+        <span><span class="k">Ctrl+Enter</span><span data-t="reveal"></span></span>
+        <span><span class="k">Ctrl+C</span><span data-t="copy"></span></span>
+        <span><span class="k">Esc</span><span data-t="close"></span></span>
+      </div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

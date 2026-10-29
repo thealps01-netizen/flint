@@ -1,0 +1,69 @@
+# Checks every push to main and every pull request on Windows: format,
+# lints, all tests, the claims check, and an unsigned installer kept as a
+# build artifact. Nothing is published.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/flint-app/ui/package-lock.json
+
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Install UI dependencies
+        run: npm --prefix crates/flint-app/ui ci
+
+      # the app embeds the built UI, so it is built before the Rust code
+      - name: Build the UI
+        run: npm --prefix crates/flint-app/ui run build
+
+      - name: Lints
+        run: cargo clippy --workspace --release --all-targets -- -D warnings
+
+      - name: Rust tests
+        # every failing test is reported, not only the first crate's
+        run: cargo test --workspace --release --no-fail-fast
+
+      - name: UI tests
+        run: npm --prefix crates/flint-app/ui test
+
+      - name: No speed claim without its measurement
+        run: node scripts/check-claims.mjs
+
+      # Reported, not enforced: the 8 ms budget is set on the reference
+      # machine in docs/benchmarks/core-baseline.md; shared CI runners are
+      # slower and noisier.
+      - name: Search benchmark (report only)
+        continue-on-error: true
+        run: cargo run -p flint-bench --release -- bench --entries 2000000 --seed 42
+
+      - name: Installer (unsigned, no update address)
+        run: npm --prefix crates/flint-app/ui run release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flint-installer
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error

@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings",
+  "description": "What the Settings page may call: events, and the folder picker",
+  "windows": [
+    "settings"
+  ],
+  "permissions": [
+    "core:event:default",
+    "dialog:allow-open"
+  ]
+}
