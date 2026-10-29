@@ -62,6 +62,9 @@ const en = {
   extraHint: "Indexed in Basic mode besides your user folder. Applies after Flint restarts.",
   excluded: "Excluded folders",
   excludedHint: "Never shown in results.",
+  appData: "Search app data folders",
+  appDataHint:
+    "Hidden AppData folders: program caches and settings, some game saves. Uses much more memory. Applies after Flint restarts.",
   addFolder: "Add folder…",
   remove: "Remove {0}",
   none: "None",
@@ -150,6 +153,9 @@ const tr: typeof en = {
   extraHint: "Temel modda kullanıcı klasörünüze ek olarak dizinlenir. Flint yeniden başlayınca geçerli olur.",
   excluded: "Hariç tutulan klasörler",
   excludedHint: "Sonuçlarda hiç gösterilmez.",
+  appData: "Program verisi klasörlerini de ara",
+  appDataHint:
+    "Gizli AppData klasörleri: program önbellekleri ve ayarları, bazı oyun kayıtları. Çok daha fazla bellek kullanır. Flint yeniden başlayınca geçerli olur.",
   addFolder: "Klasör ekle…",
   remove: "{0} kaldır",
   none: "Yok",

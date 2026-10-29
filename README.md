@@ -30,6 +30,12 @@ Flint searches file and folder **names**, not the text inside files.
    - **No:** Flint indexes only your own folders (basic mode). You can
      turn full indexing on later from Flint.
 
+   Basic mode leaves out the hidden app data folders (`AppData`): they
+   hold program caches and settings, and most of a profile's entries,
+   so Windows' own search leaves them out by default too. The Start menu
+   shortcuts kept there are still indexed. **Settings → Search app data
+   folders** brings the rest back (a few games keep their saves there).
+
 Needs Windows 10 version 22H2 or Windows 11, 64-bit. The installer adds
 Microsoft's WebView2 runtime if it is missing (it comes with Windows 11).
 

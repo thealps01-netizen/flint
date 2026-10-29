@@ -19,6 +19,8 @@ pub struct WalkStats {
     pub entries: usize,
     pub unreadable_dirs: usize,
     pub links_skipped: usize,
+    /// Folders listed but not entered (see [`Skip`]).
+    pub skipped_dirs: usize,
     /// The walk was stopped before it finished.
     pub stopped: bool,
 }
@@ -164,6 +166,83 @@ pub fn ensure_dir_chain(ix: &mut Index, map: &mut PathMap, dir: &Path) -> Option
     cur
 }
 
+/// Folders a walk lists but does not enter, and whose watch events are
+/// dropped, except below a root that lies inside one of them (the Start
+/// menu inside a skipped AppData). Compared case-insensitively, like
+/// Windows.
+#[derive(Clone, Debug, Default)]
+pub struct Skip {
+    dirs: Vec<String>,
+    keep: Vec<String>,
+}
+
+fn path_key(p: &Path) -> String {
+    p.to_string_lossy().trim_end_matches('\\').to_lowercase()
+}
+
+/// `k` is `base` or lies below it (keys from [`path_key`]).
+fn key_within(k: &str, base: &str) -> bool {
+    k.strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+}
+
+/// `p` is `base` or lies below it, case-insensitively.
+pub(crate) fn is_within(p: &Path, base: &Path) -> bool {
+    key_within(&path_key(p), &path_key(base))
+}
+
+impl Skip {
+    /// Skips `dirs`, except inside those of `roots` that lie in one.
+    pub fn new(dirs: &[PathBuf], roots: &[PathBuf]) -> Skip {
+        let dirs: Vec<String> = dirs.iter().map(|d| path_key(d)).collect();
+        let keep = roots
+            .iter()
+            .map(|r| path_key(r))
+            .filter(|r| dirs.iter().any(|d| key_within(r, d)))
+            .collect();
+        Skip { dirs, keep }
+    }
+
+    /// A folder the walk lists but does not enter.
+    fn is_skipped_dir(&self, p: &Path) -> bool {
+        if self.dirs.is_empty() {
+            return false;
+        }
+        let k = path_key(p);
+        self.dirs.contains(&k)
+    }
+
+    /// `p` lies inside a skipped folder (not the folder itself) and not
+    /// inside a root kept there.
+    fn hides(&self, p: &Path) -> bool {
+        if self.dirs.is_empty() {
+            return false;
+        }
+        let k = path_key(p);
+        self.dirs
+            .iter()
+            .any(|d| k.len() > d.len() && key_within(&k, d))
+            && !self.keep.iter().any(|r| key_within(&k, r))
+    }
+
+    /// The event to apply, if any: a move across the edge of a skipped
+    /// folder becomes an add or a removal.
+    pub fn filter(&self, ev: FsEvent) -> Option<FsEvent> {
+        match ev {
+            FsEvent::Added(ref p) | FsEvent::Removed(ref p) | FsEvent::Modified(ref p) => {
+                (!self.hides(p)).then_some(ev)
+            }
+            FsEvent::Renamed(a, b) => match (self.hides(&a), self.hides(&b)) {
+                (true, true) => None,
+                (true, false) => Some(FsEvent::Added(b)),
+                (false, true) => Some(FsEvent::Removed(a)),
+                (false, false) => Some(FsEvent::Renamed(a, b)),
+            },
+            FsEvent::Overflow => Some(ev),
+        }
+    }
+}
+
 /// Indexes everything below `root` (which is created with its parents if
 /// needed). `on_progress` gets the running entry count every 10 000.
 pub fn walk(
@@ -182,6 +261,18 @@ pub fn walk_until(
     map: &mut PathMap,
     root: &Path,
     stop: &AtomicBool,
+    on_progress: impl FnMut(usize),
+) -> WalkStats {
+    walk_scoped(ix, map, root, &Skip::default(), stop, on_progress)
+}
+
+/// [`walk_until`] that lists the folders in `skip` without entering them.
+pub fn walk_scoped(
+    ix: &mut Index,
+    map: &mut PathMap,
+    root: &Path,
+    skip: &Skip,
+    stop: &AtomicBool,
     mut on_progress: impl FnMut(usize),
 ) -> WalkStats {
     let mut stats = WalkStats::default();
@@ -192,11 +283,11 @@ pub fn walk_until(
     walk_below(
         ix,
         map,
-        root.to_path_buf(),
-        rid,
+        (root.to_path_buf(), rid),
         &mut stats,
         &mut on_progress,
         stop,
+        skip,
     );
     stats
 }
@@ -204,13 +295,13 @@ pub fn walk_until(
 fn walk_below(
     ix: &mut Index,
     map: &mut PathMap,
-    dir: PathBuf,
-    id: EntryId,
+    start: (PathBuf, EntryId),
     stats: &mut WalkStats,
     on_progress: &mut impl FnMut(usize),
     stop: &AtomicBool,
+    skip: &Skip,
 ) {
-    let mut stack = vec![(dir, id)];
+    let mut stack = vec![start];
     while let Some((dir, id)) = stack.pop() {
         if stop.load(Ordering::Relaxed) {
             stats.stopped = true;
@@ -235,10 +326,13 @@ fn walk_below(
                 on_progress(stats.entries);
             }
             if is_dir {
+                let path = e.path();
                 if is_link(&md) {
                     stats.links_skipped += 1;
+                } else if skip.is_skipped_dir(&path) {
+                    stats.skipped_dirs += 1;
                 } else {
-                    stack.push((e.path(), child));
+                    stack.push((path, child));
                 }
             }
         }
@@ -360,11 +454,11 @@ fn add_path(ix: &mut Index, map: &mut PathMap, p: &Path) {
         walk_below(
             ix,
             map,
-            p.to_path_buf(),
-            id,
+            (p.to_path_buf(), id),
             &mut stats,
             &mut |_| {},
             &never,
+            &Skip::default(),
         );
     }
 }
@@ -628,5 +722,82 @@ pub(crate) mod tests {
         assert!(apply_fs_event(&mut ix, &mut map, &FsEvent::Overflow));
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn walk_does_not_enter_a_skipped_folder() {
+        let d = tmp("skip");
+        std::fs::create_dir_all(d.join(r"AppData\Local\Temp")).unwrap();
+        std::fs::write(d.join(r"AppData\Local\Temp\x.tmp"), b"x").unwrap();
+        std::fs::write(d.join("belge.txt"), b"x").unwrap();
+        let (mut ix, mut map) = (Index::new(), PathMap::new());
+        let skip = Skip::new(&[d.join(r"appdata\LOCAL")], std::slice::from_ref(&d));
+        let s = walk_scoped(
+            &mut ix,
+            &mut map,
+            &d,
+            &skip,
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        assert_eq!(s.skipped_dirs, 1);
+        assert!(map.resolve(&ix, &d.join("belge.txt")).is_some());
+        assert!(
+            map.resolve(&ix, &d.join(r"AppData\Local")).is_some(),
+            "the skipped folder itself is listed"
+        );
+        assert!(map.resolve(&ix, &d.join(r"AppData\Local\Temp")).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn skip_drops_events_inside_a_skipped_folder_but_not_inside_a_root_there() {
+        let home = PathBuf::from(r"C:\Users\Deniz");
+        let app = home.join(r"AppData\Roaming");
+        let menu = app.join(r"Microsoft\Windows\Start Menu\Programs");
+        let skip = Skip::new(std::slice::from_ref(&app), &[home.clone(), menu.clone()]);
+        let inside = app.join(r"Oyun\kayit.sav");
+        let outside = home.join(r"Documents\rapor.txt");
+        let lnk = menu.join("Discord.lnk");
+        assert_eq!(skip.filter(FsEvent::Added(inside.clone())), None);
+        assert_eq!(skip.filter(FsEvent::Modified(app.join("X"))), None);
+        assert_eq!(
+            skip.filter(FsEvent::Added(outside.clone())),
+            Some(FsEvent::Added(outside.clone()))
+        );
+        assert_eq!(
+            skip.filter(FsEvent::Added(lnk.clone())),
+            Some(FsEvent::Added(lnk.clone()))
+        );
+        // case-insensitive, like Windows
+        let upper = PathBuf::from(r"C:\USERS\DENIZ\APPDATA\ROAMING\Y");
+        assert_eq!(skip.filter(FsEvent::Removed(upper)), None);
+        // the folder itself is an entry: its own events still count
+        assert_eq!(
+            skip.filter(FsEvent::Removed(app.clone())),
+            Some(FsEvent::Removed(app.clone()))
+        );
+        // moves across the edge become an add or a removal
+        assert_eq!(
+            skip.filter(FsEvent::Renamed(inside.clone(), outside.clone())),
+            Some(FsEvent::Added(outside.clone()))
+        );
+        assert_eq!(
+            skip.filter(FsEvent::Renamed(outside.clone(), inside.clone())),
+            Some(FsEvent::Removed(outside.clone()))
+        );
+        assert_eq!(skip.filter(FsEvent::Overflow), Some(FsEvent::Overflow));
+        // a name that only starts like the skipped folder is not inside it
+        let near = home.join(r"AppData\RoamingNotes\a.txt");
+        assert_eq!(
+            skip.filter(FsEvent::Added(near.clone())),
+            Some(FsEvent::Added(near))
+        );
+        // nothing skipped: everything passes
+        let none = Skip::default();
+        assert_eq!(
+            none.filter(FsEvent::Added(inside.clone())),
+            Some(FsEvent::Added(inside))
+        );
     }
 }

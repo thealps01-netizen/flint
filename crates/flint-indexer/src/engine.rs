@@ -16,7 +16,7 @@ use crate::server::Shared;
 use crate::snapshot::{self, SnapshotError, VolumeSnapshot};
 use crate::volindex::VolumeIndex;
 use crate::volume::{self, JournalInfo, Replay, Volume};
-use crate::walk::{self, FsEvent, PathMap};
+use crate::walk::{self, FsEvent, PathMap, Skip};
 use crate::{log, watch};
 use flint_core::Index;
 use std::io;
@@ -35,8 +35,13 @@ pub const SAVE_EVERY: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug)]
 pub enum Mode {
-    /// Walk and watch these folders; serve the current user only.
-    User { roots: Vec<PathBuf>, sid: String },
+    /// Walk and watch these folders, except inside `skip` (unless a root
+    /// lies there); serve the current user only.
+    User {
+        roots: Vec<PathBuf>,
+        skip: Vec<PathBuf>,
+        sid: String,
+    },
     /// Every fixed NTFS volume, every account.
     Service,
 }
@@ -58,11 +63,24 @@ impl Config {
         let sid = current_user_sid()?;
         Ok(Config {
             sddl: user_sddl(&sid),
-            mode: Mode::User { roots, sid },
+            mode: Mode::User {
+                roots,
+                skip: Vec::new(),
+                sid,
+            },
             data_dir,
             pipe_name,
             save_every: SAVE_EVERY,
         })
+    }
+
+    /// A user-mode config that lists the folders in `dirs` without
+    /// entering them (no effect on the service).
+    pub fn skipping(mut self, dirs: Vec<PathBuf>) -> Config {
+        if let Mode::User { skip, .. } = &mut self.mode {
+            *skip = dirs;
+        }
+        self
     }
 
     /// The service engine on the well-known pipe.
@@ -143,7 +161,7 @@ pub struct Engine {
 impl Engine {
     pub fn start(cfg: Config) -> io::Result<Engine> {
         match cfg.mode.clone() {
-            Mode::User { roots, sid } => start_user(cfg, roots, sid),
+            Mode::User { roots, skip, sid } => start_user(cfg, roots, skip, sid),
             Mode::Service => start_service(cfg),
         }
     }
@@ -256,7 +274,13 @@ fn save(path: &std::path::Path, snaps: &[VolumeSnapshot]) {
 
 // ---------------------------------------------------------------- user mode
 
-fn start_user(cfg: Config, roots: Vec<PathBuf>, sid: String) -> io::Result<Engine> {
+fn start_user(
+    cfg: Config,
+    roots: Vec<PathBuf>,
+    skip: Vec<PathBuf>,
+    sid: String,
+) -> io::Result<Engine> {
+    let skip = Skip::new(&skip, &roots);
     std::fs::create_dir_all(&cfg.data_dir)?;
     let mut ix = Index::new();
     let mut kind = StartKind::Cold;
@@ -286,7 +310,7 @@ fn start_user(cfg: Config, roots: Vec<PathBuf>, sid: String) -> io::Result<Engin
         let (shared, stop, live) = (shared.clone(), stop.clone(), live.clone());
         std::thread::Builder::new()
             .name("flint-user".into())
-            .spawn(move || run_user(&cfg, &roots, &shared, &stop, &live))?
+            .spawn(move || run_user(&cfg, &roots, &skip, &shared, &stop, &live))?
     };
     Ok(Engine {
         shared,
@@ -302,12 +326,22 @@ fn start_user(cfg: Config, roots: Vec<PathBuf>, sid: String) -> io::Result<Engin
     })
 }
 
-fn set_volumes(shared: &Shared, roots: &[PathBuf], state: &str) {
-    let mut drives: Vec<String> = roots
+/// The drives `roots` lie on, each once, in first-seen order.
+fn drives_of(roots: &[PathBuf]) -> Vec<String> {
+    let mut drives: Vec<String> = Vec::new();
+    for d in roots
         .iter()
         .filter_map(|r| r.to_str().and_then(|s| s.get(..2)).map(str::to_uppercase))
-        .collect();
-    drives.dedup();
+    {
+        if !drives.contains(&d) {
+            drives.push(d);
+        }
+    }
+    drives
+}
+
+fn set_volumes(shared: &Shared, roots: &[PathBuf], state: &str) {
+    let drives = drives_of(roots);
     if let Ok(mut v) = shared.volumes.lock() {
         *v = drives
             .into_iter()
@@ -321,12 +355,12 @@ fn set_volumes(shared: &Shared, roots: &[PathBuf], state: &str) {
 }
 
 /// A complete walk of `roots` into a new index; `None` when stopped.
-fn fresh_walk(roots: &[PathBuf], stop: &AtomicBool) -> Option<(Index, PathMap)> {
+fn fresh_walk(roots: &[PathBuf], skip: &Skip, stop: &AtomicBool) -> Option<(Index, PathMap)> {
     let mut ix = Index::new();
     let mut map = PathMap::new();
     let t = Instant::now();
     for r in roots {
-        let s = walk::walk_until(&mut ix, &mut map, r, stop, |_| {});
+        let s = walk::walk_scoped(&mut ix, &mut map, r, skip, stop, |_| {});
         if s.stopped {
             return None;
         }
@@ -346,7 +380,14 @@ fn fresh_walk(roots: &[PathBuf], stop: &AtomicBool) -> Option<(Index, PathMap)> 
     Some((ix, map))
 }
 
-fn run_user(cfg: &Config, roots: &[PathBuf], shared: &Shared, stop: &AtomicBool, live: &Live) {
+fn run_user(
+    cfg: &Config,
+    roots: &[PathBuf],
+    skip: &Skip,
+    shared: &Shared,
+    stop: &AtomicBool,
+    live: &Live,
+) {
     // watch first: no change made during the walk is missed
     let (tx, rx) = channel();
     let mut watches = Vec::new();
@@ -357,12 +398,12 @@ fn run_user(cfg: &Config, roots: &[PathBuf], shared: &Shared, stop: &AtomicBool,
         }
     }
     drop(tx);
-    let Some(mut map) = publish_walk(roots, shared, stop) else {
+    let Some(mut map) = publish_walk(roots, skip, shared, stop) else {
         return;
     };
     set_volumes(shared, roots, "basic");
     live.set();
-    drain(&rx, shared, &mut map, roots, stop, Duration::ZERO);
+    drain(&rx, shared, &mut map, roots, skip, stop, Duration::ZERO);
     // saved at once: a process that is killed later (a crash, a forced
     // quit) still starts warm next time instead of walking from scratch
     save_user(cfg, shared);
@@ -374,6 +415,7 @@ fn run_user(cfg: &Config, roots: &[PathBuf], shared: &Shared, stop: &AtomicBool,
             shared,
             &mut map,
             roots,
+            skip,
             stop,
             Duration::from_millis(100),
         );
@@ -390,8 +432,13 @@ fn run_user(cfg: &Config, roots: &[PathBuf], shared: &Shared, stop: &AtomicBool,
 
 /// Walks into a new index and serves it; the new path map, or `None`
 /// when stopped (the old index stays served).
-fn publish_walk(roots: &[PathBuf], shared: &Shared, stop: &AtomicBool) -> Option<PathMap> {
-    let (ix, map) = fresh_walk(roots, stop)?;
+fn publish_walk(
+    roots: &[PathBuf],
+    skip: &Skip,
+    shared: &Shared,
+    stop: &AtomicBool,
+) -> Option<PathMap> {
+    let (ix, map) = fresh_walk(roots, skip, stop)?;
     match shared.index.write() {
         Ok(mut g) => *g = ix,
         Err(_) => {
@@ -409,6 +456,7 @@ fn drain(
     shared: &Shared,
     map: &mut PathMap,
     roots: &[PathBuf],
+    skip: &Skip,
     stop: &AtomicBool,
     wait: Duration,
 ) -> bool {
@@ -423,6 +471,10 @@ fn drain(
     if batch.is_empty() {
         return false;
     }
+    let batch: Vec<FsEvent> = batch.into_iter().filter_map(|e| skip.filter(e)).collect();
+    if batch.is_empty() {
+        return false;
+    }
     let mut rewalk = false;
     if let Ok(mut ix) = shared.index.write() {
         for e in &batch {
@@ -431,7 +483,7 @@ fn drain(
     }
     if rewalk {
         log::line("watch buffer overflowed: walking again");
-        if let Some(m) = publish_walk(roots, shared, stop) {
+        if let Some(m) = publish_walk(roots, skip, shared, stop) {
             *map = m;
         }
     }
@@ -1204,3 +1256,22 @@ fn save_service(
 
 /// Share of left-over name text above which a save compacts first.
 const COMPACT_GARBAGE: f64 = 0.3;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_drive_is_listed_once_in_first_seen_order() {
+        let roots: Vec<PathBuf> = [
+            r"C:\Users\u",
+            r"d:\Proj",
+            r"C:\Users\u\AppData\Local",
+            r"D:\x",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(drives_of(&roots), vec!["C:", "D:"]);
+    }
+}
