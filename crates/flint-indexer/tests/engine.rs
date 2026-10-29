@@ -206,6 +206,20 @@ fn engine_searches_in_process_like_its_pipe() {
     let ServerMsg::Results { hits: piped, .. } = c.query("rapor", 10, boosts).unwrap() else {
         panic!()
     };
-    assert_eq!(local, piped, "same answer in-process and over the pipe");
+    // the score's recency part counts seconds from now: a second boundary
+    // between the two searches may move it by one point
+    let strip = |h: &[flint_indexer::protocol::WireHit]| {
+        h.iter()
+            .map(|h| (h.path.clone(), h.typo, h.highlights.clone(), h.last_change))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        strip(&local),
+        strip(&piped),
+        "same answer in-process and over the pipe"
+    );
+    for (a, b) in local.iter().zip(&piped) {
+        assert!((a.score - b.score).abs() <= 1, "{} vs {}", a.score, b.score);
+    }
     e.stop();
 }
