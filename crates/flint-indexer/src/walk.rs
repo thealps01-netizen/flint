@@ -179,7 +179,8 @@ pub fn walk(
     walk_until(ix, map, root, &AtomicBool::new(false), on_progress)
 }
 
-/// [`walk`] that ends early (between folders) once `stop` is set.
+/// [`walk`] that ends early once `stop` is set: checked at every entry,
+/// so a large folder read slowly does not hold the stop until it is listed.
 pub fn walk_until(
     ix: &mut Index,
     map: &mut PathMap,
@@ -224,6 +225,10 @@ fn walk_below(
             continue;
         };
         for e in rd.flatten() {
+            if stop.load(Ordering::Relaxed) {
+                stats.stopped = true;
+                return;
+            }
             // DirEntry::metadata comes from the directory listing on Windows
             let Ok(md) = e.metadata() else { continue };
             let name = e.file_name().to_string_lossy().into_owned();
@@ -392,6 +397,24 @@ pub(crate) mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn walk_stops_inside_a_large_folder() {
+        // one folder read slowly (a cold or network disk) must not hold a
+        // stop until the whole folder is listed
+        let d = tmp("big-folder");
+        for i in 0..10_500 {
+            std::fs::File::create(d.join(format!("f{i}"))).unwrap();
+        }
+        let (mut ix, mut map) = (Index::new(), PathMap::new());
+        let stop = AtomicBool::new(false);
+        let s = walk_until(&mut ix, &mut map, &d, &stop, |_| {
+            stop.store(true, Ordering::Relaxed)
+        });
+        assert!(s.stopped);
+        assert_eq!(s.entries, 10_000, "entries listed after the stop");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
