@@ -223,3 +223,52 @@ fn engine_searches_in_process_like_its_pipe() {
     }
     e.stop();
 }
+
+#[test]
+fn a_skipped_folder_is_not_indexed_but_a_root_inside_it_is() {
+    let root = tmp("skip");
+    let data = tmp("skip-data");
+    let app = root.join(r"AppData\Roaming");
+    let menu = app.join(r"Microsoft\Windows\Start Menu\Programs");
+    std::fs::create_dir_all(&menu).unwrap();
+    std::fs::write(app.join("oyun-kaydi.sav"), b"x").unwrap();
+    std::fs::write(menu.join("Discord.lnk"), b"x").unwrap();
+    std::fs::write(root.join("rapor.txt"), b"x").unwrap();
+    let name = pipe("skip");
+    let cfg = Config::user(vec![root.clone(), menu.clone()], data.clone(), name.clone())
+        .unwrap()
+        .skipping(vec![app.clone()]);
+    let e = Engine::start(cfg).unwrap();
+    assert!(e.wait_live(Duration::from_secs(20)));
+    assert_eq!(hits(&name, "rapor").len(), 1);
+    assert!(
+        hits(&name, "oyun kaydi").is_empty(),
+        "inside the skipped folder"
+    );
+    assert_eq!(
+        hits(&name, "roaming"),
+        vec![app.display().to_string()],
+        "the skipped folder itself is still found"
+    );
+    assert_eq!(
+        hits(&name, "discord"),
+        vec![menu.join("Discord.lnk").display().to_string()],
+        "a root inside the skipped folder is walked"
+    );
+
+    // changes made while running follow the same rule
+    std::fs::write(app.join("yeni-kayit.sav"), b"x").unwrap();
+    std::fs::write(menu.join("Spotify.lnk"), b"x").unwrap();
+    std::fs::write(root.join("yeni-rapor.txt"), b"x").unwrap();
+    eventually("a new file outside", || {
+        hits(&name, "yeni rapor").len() == 1
+    });
+    eventually("a new shortcut", || hits(&name, "spotify").len() == 1);
+    assert!(
+        hits(&name, "yeni kayit").is_empty(),
+        "a change inside the skipped folder"
+    );
+    e.stop();
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}

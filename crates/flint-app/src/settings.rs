@@ -39,6 +39,9 @@ pub struct Settings {
     pub extra_folders: Vec<PathBuf>,
     /// Never shown in results.
     pub excluded_folders: Vec<PathBuf>,
+    /// Basic mode walks the hidden app data folders too (from the next
+    /// start). Off: they hold program caches, not the user's files.
+    pub index_app_data: bool,
     /// Look for a new version once a day (release builds only).
     pub check_updates: bool,
 }
@@ -53,6 +56,7 @@ impl Default for Settings {
             use_windows_recent: true,
             extra_folders: Vec::new(),
             excluded_folders: Vec::new(),
+            index_app_data: false,
             check_updates: true,
         }
     }
@@ -158,6 +162,7 @@ mod tests {
         assert!(s.use_windows_recent);
         assert!(s.check_updates);
         assert!(s.extra_folders.is_empty() && s.excluded_folders.is_empty());
+        assert!(!s.index_app_data);
         // a missing file is the defaults too
         assert_eq!(Settings::load(&temp("missing").join("settings.json")), s);
     }
@@ -173,6 +178,7 @@ mod tests {
             use_windows_recent: false,
             extra_folders: vec![r"D:\Projeler".into()],
             excluded_folders: vec![r"C:\Users\x\node_modules".into()],
+            index_app_data: true,
             check_updates: false,
         };
         s.save(&f).unwrap();

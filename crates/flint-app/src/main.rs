@@ -112,7 +112,7 @@ fn seed_history(h: &std::sync::Mutex<history::History>) {
     }
 }
 
-fn build_sources(extra_folders: &[std::path::PathBuf]) -> sources::Sources {
+fn build_sources(extra_folders: &[std::path::PathBuf], index_app_data: bool) -> sources::Sources {
     // FLINT_OTHER_DRIVES replaces the detected list ("" = none), for test
     // runs on machines whose owner has not agreed to a drive being walked
     let detected = match std::env::var("FLINT_OTHER_DRIVES") {
@@ -134,18 +134,19 @@ fn build_sources(extra_folders: &[std::path::PathBuf]) -> sources::Sources {
         .collect();
     let mut always = Vec::new();
     if !other.is_empty() {
-        match sources::start_local("drives", other) {
+        match sources::start_local("drives", other, Vec::new()) {
             Ok(b) => always.push(b),
             Err(e) => log::line(format!("drives without NTFS are not indexed: {e}")),
         }
     }
-    // without the service: the profile folder plus Settings' extra folders
+    // without the service: the profile folder (its app data folders only
+    // when Settings asks) plus Settings' extra folders
     let extra = extra_folders.to_vec();
     let profile = Box::new(move || {
         let home = std::env::var_os("USERPROFILE").ok_or("USERPROFILE is not set")?;
-        let mut roots = vec![std::path::PathBuf::from(home)];
-        roots.extend(extra.iter().filter(|f| f.is_dir()).cloned());
-        sources::start_local("profile", roots)
+        let scope = flint_indexer::folders::user_scope(home.into(), index_app_data)
+            .with_extra(extra.iter().filter(|f| f.is_dir()).cloned().collect());
+        sources::start_local("profile", scope.roots, scope.skip)
     });
     sources::Sources::new(Box::new(sources::ServicePipe::default()), always, profile)
 }
@@ -444,7 +445,9 @@ fn main() {
                 std::thread::spawn(move || {
                     // search first: reading Windows' recent items can wait
                     // on network paths, and must not hold up the first query
-                    let _ = state.sources.set(build_sources(&st.extra_folders));
+                    let _ = state
+                        .sources
+                        .set(build_sources(&st.extra_folders, st.index_app_data));
                     if st.use_windows_recent {
                         let state = state.clone();
                         std::thread::spawn(move || seed_history(&state.history));

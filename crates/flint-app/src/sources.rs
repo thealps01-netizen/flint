@@ -515,14 +515,20 @@ impl Backend for Local {
 
 /// Starts an in-process indexer over `roots`, saving to
 /// `%LOCALAPPDATA%\Flint\<tag>` and serving on a pipe of its own.
-pub fn start_local(tag: &str, roots: Vec<std::path::PathBuf>) -> Result<Box<dyn Backend>, String> {
+pub fn start_local(
+    tag: &str,
+    roots: Vec<std::path::PathBuf>,
+    skip: Vec<std::path::PathBuf>,
+) -> Result<Box<dyn Backend>, String> {
     use flint_indexer::engine::{Config, Engine};
     use flint_indexer::pipe::{current_user_sid, user_pipe_name};
     let base = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is not set")?;
     let data = std::path::PathBuf::from(base).join("Flint").join(tag);
     let sid = current_user_sid().map_err(|e| e.to_string())?;
     let pipe = format!("{}-app-{tag}", user_pipe_name(&sid));
-    let cfg = Config::user(roots, data, pipe).map_err(|e| e.to_string())?;
+    let cfg = Config::user(roots, data, pipe)
+        .map_err(|e| e.to_string())?
+        .skipping(skip);
     Engine::start(cfg)
         .map(|e| Box::new(Local::new(e)) as Box<dyn Backend>)
         .map_err(|e| e.to_string())

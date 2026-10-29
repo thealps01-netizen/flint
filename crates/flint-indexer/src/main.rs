@@ -49,6 +49,9 @@ enum Cmd {
         /// Folders to index in user mode (repeatable).
         #[arg(long = "root")]
         roots: Vec<std::path::PathBuf>,
+        /// Without `--root`: walk the hidden app data folders too.
+        #[arg(long)]
+        include_app_data: bool,
     },
     /// Install and start the FlintIndexer service (administrator).
     InstallService,
@@ -71,7 +74,11 @@ fn main() -> ExitCode {
         } => scan::run(&drive, snapshot.as_deref(), follow),
         Cmd::Query { text, limit } => query(&text, limit),
         Cmd::Status => status(),
-        Cmd::Serve { user_mode, roots } => serve::run(user_mode, roots),
+        Cmd::Serve {
+            user_mode,
+            roots,
+            include_app_data,
+        } => serve::run(user_mode, roots, include_app_data),
         Cmd::InstallService => serve::admin(serve::Admin::Install),
         Cmd::UninstallService => serve::admin(serve::Admin::Uninstall),
         Cmd::StopService => serve::admin(serve::Admin::Stop),
@@ -151,7 +158,7 @@ mod serve {
         1
     }
 
-    pub fn run(user_mode: bool, roots: Vec<PathBuf>) -> ExitCode {
+    pub fn run(user_mode: bool, roots: Vec<PathBuf>, include_app_data: bool) -> ExitCode {
         let cfg = if user_mode {
             let sid = match current_user_sid() {
                 Ok(s) => s,
@@ -160,16 +167,19 @@ mod serve {
                     return ExitCode::from(2);
                 }
             };
-            let roots = if roots.is_empty() {
+            let scope = if roots.is_empty() {
                 match std::env::var_os("USERPROFILE") {
-                    Some(p) => vec![PathBuf::from(p)],
+                    Some(p) => flint_indexer::folders::user_scope(p.into(), include_app_data),
                     None => {
                         eprintln!("USERPROFILE is not set: pass --root");
                         return ExitCode::from(2);
                     }
                 }
             } else {
-                roots
+                flint_indexer::folders::Scope {
+                    roots,
+                    skip: Vec::new(),
+                }
             };
             let Some(data) =
                 std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Flint"))
@@ -177,8 +187,8 @@ mod serve {
                 eprintln!("LOCALAPPDATA is not set");
                 return ExitCode::from(2);
             };
-            match Config::user(roots, data, user_pipe_name(&sid)) {
-                Ok(c) => c,
+            match Config::user(scope.roots, data, user_pipe_name(&sid)) {
+                Ok(c) => c.skipping(scope.skip),
                 Err(e) => {
                     eprintln!("{e}");
                     return ExitCode::from(2);

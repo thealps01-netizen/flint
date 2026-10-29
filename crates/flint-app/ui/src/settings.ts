@@ -13,6 +13,7 @@ interface Settings {
   useWindowsRecent: boolean;
   extraFolders: string[];
   excludedFolders: string[];
+  indexAppData: boolean;
   checkUpdates: boolean;
 }
 interface UpdateInfo {
@@ -130,7 +131,8 @@ function render() {
     `<h2>${esc(L("secIndex"))}</h2><div class="card">` +
     `<div class="row col"><div class="lb"><b>${esc(L("drives"))}</b></div><div>${volumes.map(driveState).join("") || esc(L("none"))}</div></div>` +
     `<div class="row col"><div class="lb"><b>${esc(L("excluded"))}</b><small>${esc(L("excludedHint"))}</small></div>${folders("excludedFolders", s.excludedFolders)}</div>` +
-    `<div class="row col"><div class="lb"><b>${esc(L("extraFolders"))}</b><small>${esc(L("extraHint"))}</small></div>${folders("extraFolders", s.extraFolders)}</div></div>` +
+    `<div class="row col"><div class="lb"><b>${esc(L("extraFolders"))}</b><small>${esc(L("extraHint"))}</small></div>${folders("extraFolders", s.extraFolders)}</div>` +
+    `<div class="row"><div class="lb"><b>${esc(L("appData"))}</b><small>${esc(L("appDataHint"))}</small></div>${sw("appdata", s.indexAppData, "appData")}</div></div>` +
     `<h2>${esc(L("secHistory"))}</h2><div class="card">` +
     `<div class="row"><div class="lb"><b>${esc(L("useRecent"))}</b><small>${esc(L("useRecentHint"))}</small></div>${sw("recent", s.useWindowsRecent, "useRecent")}</div>` +
     `<div class="row"><div class="lb">${note ? `<span class="ok" role="status">${esc(note)}</span>` : ""}</div><button class="btn" id="clear">${esc(L("clearHistory"))}</button></div></div>` +
@@ -179,6 +181,7 @@ root.addEventListener("click", async (e) => {
     render();
   } else if (el.id === "startup") void save({ launchAtStartup: !s.launchAtStartup });
   else if (el.id === "recent") void save({ useWindowsRecent: !s.useWindowsRecent });
+  else if (el.id === "appdata") void save({ indexAppData: !s.indexAppData });
   else if (el.id === "updates") void save({ checkUpdates: !s.checkUpdates });
   else if (el.id === "check-update" && upd) {
     updBusy = true;
