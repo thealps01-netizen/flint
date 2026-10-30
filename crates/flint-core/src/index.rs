@@ -78,9 +78,9 @@ impl DirTree {
         } else {
             NONE
         };
-        self.pos_of.push(pos);
+        push_col(&mut self.pos_of, pos);
         let o = self.owner_of(ix, id);
-        self.entry_owner.push(o);
+        push_col(&mut self.entry_owner, o);
     }
 
     /// Owner of entry `id` from the directory owners (its directory and
@@ -103,12 +103,12 @@ impl DirTree {
     fn add_dir(&mut self, ix: &Index, id: EntryId) -> u32 {
         let pos = self.order.len() as u32;
         let (ppos, class, owner, rule_node) = self.derive(ix, id);
-        self.order.push(id.0);
-        self.parent_pos.push(ppos);
-        self.class.push(class);
-        self.mask.push(ix.mask(id));
-        self.owner.push(owner);
-        self.rule_node.push(rule_node);
+        push_col(&mut self.order, id.0);
+        push_col(&mut self.parent_pos, ppos);
+        push_col(&mut self.class, class);
+        push_col(&mut self.mask, ix.mask(id));
+        push_col(&mut self.owner, owner);
+        push_col(&mut self.rule_node, rule_node);
         pos
     }
 
@@ -265,6 +265,36 @@ pub struct Index {
     dir_tree: std::sync::OnceLock<DirTree>,
 }
 
+/// How much a full column grows: an eighth of its length, at least
+/// `min`. Not doubling (what `Vec::push` does): after a warm start every
+/// column is exactly full, and doubling them all at the first new file
+/// commits as much memory again as the whole index. The cost is more
+/// copies when a column is filled one entry at a time, so a bulk load
+/// reserves its room first ([`Index::reserve`]).
+fn room(len: usize, min: usize) -> usize {
+    (len / 8).max(min)
+}
+
+/// Appends `x`, growing a full column by [`room`].
+fn push_col<T>(v: &mut Vec<T>, x: T) {
+    if v.len() == v.capacity() {
+        v.reserve_exact(room(v.len(), 1024));
+    }
+    v.push(x);
+}
+
+/// Lengthens `v` to `len` with `fill`, growing it the way the index's
+/// own columns grow (by an eighth, not by doubling). For columns kept
+/// beside the index, one slot per entry id.
+pub fn grow_col<T: Clone>(v: &mut Vec<T>, len: usize, fill: T) {
+    if len > v.capacity() {
+        v.reserve_exact((len - v.len()).max(room(v.len(), 1024)));
+    }
+    if len > v.len() {
+        v.resize(len, fill);
+    }
+}
+
 fn push_arena(arena: &mut String, s: &str) -> (u32, u16) {
     let off = arena.len();
     assert!(s.len() <= u16::MAX as usize, "name longer than 65535 bytes");
@@ -272,6 +302,9 @@ fn push_arena(arena: &mut String, s: &str) -> (u32, u16) {
         off + s.len() <= u32::MAX as usize,
         "name arena exceeds 4 GiB"
     );
+    if off + s.len() > arena.capacity() {
+        arena.reserve_exact(room(off, 64 * 1024).max(s.len()));
+    }
     arena.push_str(s);
     (off as u32, s.len() as u16)
 }
@@ -284,20 +317,21 @@ impl Index {
         Self::default()
     }
 
-    /// Room for `n` more entries (a warm start inserts millions at once).
+    /// Room for exactly `n` more entries (a scan inserts millions at
+    /// once; `Vec::reserve` would double columns already full).
     pub fn reserve(&mut self, n: usize) {
-        self.names.reserve(n * 20);
-        self.folded.reserve(n * 20);
-        self.name_off.reserve(n);
-        self.name_len.reserve(n);
-        self.fold_off.reserve(n);
-        self.fold_len.reserve(n);
-        self.parent.reserve(n);
-        self.flags.reserve(n);
-        self.last_change.reserve(n);
-        self.child_count.reserve(n);
-        self.drive.reserve(n);
-        self.mask.reserve(n);
+        self.names.reserve_exact(n * 20);
+        self.folded.reserve_exact(n * 20);
+        self.name_off.reserve_exact(n);
+        self.name_len.reserve_exact(n);
+        self.fold_off.reserve_exact(n);
+        self.fold_len.reserve_exact(n);
+        self.parent.reserve_exact(n);
+        self.flags.reserve_exact(n);
+        self.last_change.reserve_exact(n);
+        self.child_count.reserve_exact(n);
+        self.drive.reserve_exact(n);
+        self.mask.reserve_exact(n);
     }
 
     /// Counts a tag child in or out of `dir`; the cached tree is dropped
@@ -345,20 +379,20 @@ impl Index {
         let (no, nl) = push_arena(&mut self.names, e.name);
         let folded = crate::fold::fold_str(e.name);
         let (fo, fl) = push_arena(&mut self.folded, &folded);
-        self.mask.push(crate::fold::char_mask(&folded));
-        self.name_off.push(no);
-        self.name_len.push(nl);
-        self.fold_off.push(fo);
-        self.fold_len.push(fl);
-        self.parent.push(e.parent.map_or(NONE, |p| p.0));
+        push_col(&mut self.mask, crate::fold::char_mask(&folded));
+        push_col(&mut self.name_off, no);
+        push_col(&mut self.name_len, nl);
+        push_col(&mut self.fold_off, fo);
+        push_col(&mut self.fold_len, fl);
+        push_col(&mut self.parent, e.parent.map_or(NONE, |p| p.0));
         let camel = if crate::fold::has_camel(e.name) {
             F_CAMEL
         } else {
             0
         };
-        self.flags.push(if e.is_dir { F_DIR } else { 0 } | camel);
-        self.last_change.push(e.last_change);
-        self.child_count.push(0);
+        push_col(&mut self.flags, if e.is_dir { F_DIR } else { 0 } | camel);
+        push_col(&mut self.last_change, e.last_change);
+        push_col(&mut self.child_count, 0);
         let drive = match e.parent {
             Some(p) => self.drive[p.0 as usize],
             None => e
@@ -367,7 +401,7 @@ impl Index {
                 .next()
                 .map_or(b'?', |b| b.to_ascii_lowercase()),
         };
-        self.drive.push(drive);
+        push_col(&mut self.drive, drive);
         if let Some(p) = e.parent {
             self.child_count[p.0 as usize] += 1;
         }
@@ -1016,6 +1050,79 @@ mod tests {
             is_dir: false,
             last_change: t,
         })
+    }
+
+    /// An index of `n` entries read back from its image: every column at
+    /// exactly its length, as a warm start has it.
+    fn loaded(n: usize) -> Index {
+        let mut ix = Index::new();
+        let c = dir(&mut ix, "C:", None);
+        let mut dirs = vec![c];
+        for i in 0..n {
+            let parent = dirs[i % dirs.len()];
+            if i % 10 == 0 {
+                dirs.push(dir(&mut ix, &format!("folder {i}"), Some(parent)));
+            } else {
+                file(&mut ix, &format!("file number {i}.txt"), parent, 1);
+            }
+        }
+        let mut img = Vec::new();
+        ix.to_image(&mut img);
+        Index::from_image(&img).unwrap().0
+    }
+
+    /// A full column grows by an eighth, not by doubling: a new file
+    /// after a warm start must not double every column at once.
+    #[test]
+    fn a_full_index_grows_by_an_eighth() {
+        let mut ix = loaded(20_000);
+        let before = ix.heap_bytes();
+        let root = EntryId(0);
+        file(&mut ix, "new.txt", root, 1);
+        let after = ix.heap_bytes();
+        assert!(
+            after <= before + before / 8 + 64 * 1024,
+            "{before} -> {after}"
+        );
+        // and keeps room for more without growing again
+        for i in 0..1000 {
+            file(&mut ix, &format!("n{i}.txt"), root, 1);
+        }
+        assert_eq!(ix.heap_bytes(), after);
+    }
+
+    #[test]
+    fn a_full_folder_tree_grows_by_an_eighth() {
+        let mut ix = loaded(20_000);
+        let t = ix.dir_tree();
+        assert_eq!(t.order.capacity(), t.order.len());
+        assert_eq!(t.pos_of.capacity(), t.pos_of.len());
+        dir(&mut ix, "new folder", Some(EntryId(0)));
+        let t = ix.dir_tree();
+        let fits = |len: usize, cap: usize| cap <= len + room(len, 1024);
+        for (col, len, cap) in [
+            ("order", t.order.len(), t.order.capacity()),
+            ("parent_pos", t.parent_pos.len(), t.parent_pos.capacity()),
+            ("class", t.class.len(), t.class.capacity()),
+            ("mask", t.mask.len(), t.mask.capacity()),
+            ("owner", t.owner.len(), t.owner.capacity()),
+            ("rule_node", t.rule_node.len(), t.rule_node.capacity()),
+            ("pos_of", t.pos_of.len(), t.pos_of.capacity()),
+            ("entry_owner", t.entry_owner.len(), t.entry_owner.capacity()),
+        ] {
+            assert!(fits(len, cap), "{col}: {len} entries, room for {cap}");
+        }
+    }
+
+    /// Room asked for on top of full columns is exactly that room.
+    #[test]
+    fn reserve_on_a_full_index_adds_only_what_is_asked() {
+        let mut ix = loaded(20_000);
+        let n = ix.raw_len();
+        assert_eq!(ix.parent.capacity(), n);
+        ix.reserve(100);
+        let cap = ix.parent.capacity();
+        assert!(cap >= n + 100 && cap < n + 100 + n / 8, "{n} -> {cap}");
     }
 
     #[test]
