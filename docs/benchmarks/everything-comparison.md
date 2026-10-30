@@ -37,7 +37,7 @@ process's working set / private bytes 5 s after the run.
 |---|---|---|---|---|
 | Flint Basic | 151,618 | 3.0–5.1 s | 0.12 s | 25 / 22–26 MB |
 | Everything, same folders | 153,523 | 4.3–4.4 s | 0.10–0.12 s | 29–31 / 16–18 MB |
-| Flint Full | 1,450,240 | 33.7 s (one run) | not measured | 238–239 MB / not readable |
+| Flint Full | 1,450,240–1,451,815 | 26.7–39.5 s | 0.33 s | 231–239 / 310–392 MB |
 | Everything, C: | 4,097,124 | 18.1–20.0 s | 1.15–1.16 s | 370–377 / 359–366 MB |
 | Everything, C: without app data | 1,750,283 | 10.6–12.5 s | 0.46–2.16 s | 182–187 / 170–176 MB |
 
@@ -46,12 +46,20 @@ How to read it:
 - **Same folders:** the two are about even. Flint's warm start answers
   from its saved index at 0.12 s and then checks the folders again in the
   background (done after 2.3–3.0 s).
-- **Whole C:** Everything indexes faster and uses less memory per entry:
-  109–112 bytes per entry without app data (96 with it) against Flint
-  Full's 172–173 bytes (working set). Flint Full's 33.7 s includes the service start
-  and Flint's folder permission checks (see
+- **Whole C:, first index:** Everything builds it in less time and uses
+  less memory per entry: 109–112 bytes per entry without app data (96
+  with it) against Flint Full's 167–173 bytes of working set; in private
+  bytes 102–105 against 224–283. Flint Full's first index includes
+  Flint's folder permission checks (see
   [indexer-baseline.md](indexer-baseline.md)), which Everything does not
   make.
+- **Whole C:, restart:** Flint Full answers 0.33 s after the service
+  starts with its saved index, in all three runs; Everything without app
+  data took 0.46–2.16 s with its saved database (1.15 s with all of C:).
+- **Flint Full's private memory is higher after a restart** (383–392 MB)
+  than after a first index (310–312 MB), with the same entries and the
+  same working set. Noted as a finding; its cause has not been looked
+  into.
 - **Entries differ on C:** Everything lists every name on the volume to
   every user; Flint Full hides what the signed-in user cannot open (other
   profiles, restricted system folders). Everything's exclude list also
@@ -61,16 +69,22 @@ How to read it:
 
 ### How Flint Full was measured
 
-The service runs as LocalSystem, so it was timed from outside, without
-administrator rights: full indexing was turned off and on again in
-Flint's Settings while a script polled. The time runs from the moment
-`sc query FlintIndexer` showed the service running to the moment
-`flint-indexer status` showed `C: live`. Memory is the service process's
-working set from `tasklist`, 10 s, 60 s and 300 s after it was live; its
-private bytes are not readable without administrator rights. A warm
-start would need restarting the service as administrator and was not
-measured here; [indexer-baseline.md](indexer-baseline.md) has the last
-measured one (0.72 s, 0.1.1).
+Three first-index runs and three restarts:
+
+- Run 1, without administrator rights: full indexing was turned off and
+  on again in Flint's Settings while a script polled. Timed from the
+  moment `sc query FlintIndexer` showed the service running to the moment
+  `flint-indexer status` showed `C: live` (33.7 s); working set from
+  `tasklist` (238–239 MB, 10–300 s after).
+- Runs 2–3 and the restarts, from an elevated script: stop the service
+  (`sc stop`, 0.2–0.5 s; it saves its index image), delete the image
+  (`%ProgramData%\Flint\index.img`) for a first index or keep it for a
+  restart, wait 3 s, `sc start`, and poll `flint-indexer status` every
+  50 ms until `C: live` (39.5 s and 26.7 s; restarts 0.33 s each).
+  Working set and private bytes from `Get-Process`, 10 s and 60 s after.
+
+Between the runs the system's file cache was warm in different ways; the
+spread of the first index (26.7–39.5 s) is that.
 
 ### How Everything was run
 
@@ -132,8 +146,5 @@ program; it was not made, so no speed claim is drawn from these runs.
 
 ## Not measured here
 
-- Flint Full's warm start and private memory (both need administrator
-  rights).
-- More than one cold run of Flint Full.
 - Live updates (how fast a new file shows up) in either program.
 - Other machines, a hard disk, or a volume with more files.
