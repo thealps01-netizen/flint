@@ -244,7 +244,7 @@ impl VolumeIndex {
     fn bind(&mut self, frn: u64, id: EntryId) {
         let i = id.0 as usize;
         if self.frn_of.len() <= i {
-            self.frn_of.resize(i + 1, NO_FRN);
+            flint_core::index::grow_col(&mut self.frn_of, i + 1, NO_FRN);
         }
         self.frn_of[i] = frn;
         self.map.insert(frn, id);
@@ -611,6 +611,30 @@ mod tests {
             .collect();
         p.sort();
         p
+    }
+
+    /// After a warm start the FRN column is exactly full; the first new
+    /// file grows it by an eighth (flint_core's rule), not by doubling.
+    #[test]
+    fn a_full_frn_column_grows_by_an_eighth() {
+        let mut ix = Index::new();
+        let mut recs = vec![d(ROOT, ROOT, "")];
+        recs.extend((0..20_000u64).map(|i| f(100 + i, ROOT, &format!("f{i}.txt"))));
+        let v = VolumeIndex::build(&mut ix, "C:", ROOT, recs);
+        let p = v.parts();
+        let mut img = Vec::new();
+        ix.to_image(&mut img);
+        let (mut ix, _) = Index::from_image(&img).unwrap();
+        let mut v = VolumeIndex::from_parts(&ix, p).unwrap();
+        let n = v.frn_of.len();
+        assert_eq!(v.frn_of.capacity(), n);
+        v.apply(
+            &mut ix,
+            &rec(50_000, ROOT, "new.txt", false, USN_REASON_FILE_CREATE),
+        );
+        assert!(v.id(50_000).is_some());
+        let cap = v.frn_of.capacity();
+        assert!(cap > n && cap <= n + (n / 8).max(1024), "{n} -> {cap}");
     }
 
     #[test]

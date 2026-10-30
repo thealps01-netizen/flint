@@ -3,6 +3,21 @@
 All notable changes to Flint are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.3 — 2026-10-30
+
+- The index commits less memory once files change after a start. Its
+  columns grew by doubling, and after a start from the saved index every
+  column is exactly full, so the first new file doubled them all at once:
+  the Full indexing service then committed 383–392 MB of private memory
+  against 310–312 MB after a first index, with the same 1.45 M entries.
+  Columns now grow by an eighth. In a 1.45 M-entry test index the private
+  memory after a start and a thousand new files went from 308 MB to
+  189 MB; after a first index and one new file, from 252 MB to 184 MB.
+  The memory actually in use (working set) was the same before and after.
+  Adding entries one by one without reserving room first (a folder walk)
+  takes about 1.5 times as long, about 10 ms for Basic mode's 151 k
+  entries.
+
 ## 0.1.2 — 2026-10-30
 
 - Full indexing leaves out the hidden app data folders too, for every

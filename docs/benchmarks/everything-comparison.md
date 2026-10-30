@@ -58,8 +58,10 @@ How to read it:
   data took 0.46–2.16 s with its saved database (1.15 s with all of C:).
 - **Flint Full's private memory is higher after a restart** (383–392 MB)
   than after a first index (310–312 MB), with the same entries and the
-  same working set. Noted as a finding; its cause has not been looked
-  into.
+  same working set. The cause: the index's columns grew by doubling,
+  and after a restart every column is exactly full, so the first new
+  file doubled them all. Fixed in 0.1.3 (see the changelog); these runs
+  are 0.1.2 and were not repeated.
 - **Entries differ on C:** Everything lists every name on the volume to
   every user; Flint Full hides what the signed-in user cannot open (other
   profiles, restricted system folders). Everything's exclude list also
