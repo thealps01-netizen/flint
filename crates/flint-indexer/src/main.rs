@@ -49,7 +49,8 @@ enum Cmd {
         /// Folders to index in user mode (repeatable).
         #[arg(long = "root")]
         roots: Vec<std::path::PathBuf>,
-        /// Without `--root`: walk the hidden app data folders too.
+        /// Index the hidden app data folders too: every profile's in full
+        /// indexing, the user's in user mode without `--root`.
         #[arg(long)]
         include_app_data: bool,
     },
@@ -200,7 +201,7 @@ mod serve {
                 return ExitCode::from(3);
             }
             match service_data_dir() {
-                Ok(d) => Config::service(d),
+                Ok(d) => Config::service(d).including_app_data(include_app_data),
                 Err(e) => {
                     eprintln!("cannot prepare the data folder: {e}");
                     return ExitCode::from(2);

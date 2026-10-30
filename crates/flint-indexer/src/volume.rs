@@ -60,8 +60,8 @@ mod os {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, ERROR_NOT_ALL_ASSIGNED,
-        GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LUID,
+        CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, ERROR_NO_MORE_FILES,
+        ERROR_NOT_ALL_ASSIGNED, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LUID,
     };
     use windows_sys::Win32::Security::{
         AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
@@ -69,10 +69,12 @@ mod os {
         TOKEN_QUERY, TokenElevation,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR,
-        FILE_ID_DESCRIPTOR_0, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdType,
-        GetDriveTypeW, GetFileInformationByHandle, GetLogicalDrives, GetVolumeInformationW,
-        OPEN_EXISTING, OpenFileById, READ_CONTROL,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
+        FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdType, GetDriveTypeW,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, GetLogicalDrives,
+        GetVolumeInformationW, OPEN_EXISTING, OpenFileById, READ_CONTROL, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::{CancelSynchronousIo, DeviceIoControl};
     use windows_sys::Win32::System::Ioctl::{
@@ -312,6 +314,61 @@ mod os {
         volume_info(drive).is_ok_and(|(fs, _)| fs == "NTFS")
     }
 
+    /// The entries of the folder open as `h` (with `FILE_LIST_DIRECTORY`)
+    /// as creation records under `frn`.
+    fn list_open_dir(h: &Handle, frn: u64) -> io::Result<Vec<UsnRecord>> {
+        // FILE_ID_BOTH_DIR_INFO entries are 8-byte aligned
+        let mut buf = vec![0u64; 8 << 10];
+        let bytes = buf.len() * 8;
+        let mut class = FileIdBothDirectoryRestartInfo;
+        let mut out = Vec::new();
+        loop {
+            // SAFETY: h is an open folder handle; buf is writable for
+            // `bytes` bytes and outlives the call.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(h.raw(), class, buf.as_mut_ptr().cast(), bytes as u32)
+            };
+            if ok == 0 {
+                let e = io::Error::last_os_error();
+                return match e.raw_os_error() {
+                    Some(c) if c == ERROR_NO_MORE_FILES as i32 => Ok(out),
+                    _ => Err(e),
+                };
+            }
+            // SAFETY: buf holds `bytes` initialised bytes.
+            let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), bytes) };
+            out.extend(
+                crate::usn::parse_dir_info(raw, frn)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?,
+            );
+            class = FileIdBothDirectoryInfo;
+        }
+    }
+
+    /// [`list_open_dir`] of a folder by path, under parent FRN 7 (tests).
+    #[cfg(test)]
+    pub(super) fn list_dir_at(dir: &std::path::Path) -> io::Result<Vec<UsnRecord>> {
+        let h = open(
+            &dir.to_string_lossy(),
+            FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )?;
+        list_open_dir(&h, 7)
+    }
+
+    /// The file id (FRN on NTFS) of a path (tests).
+    #[cfg(test)]
+    pub(super) fn file_id(p: &std::path::Path) -> io::Result<u64> {
+        let h = open(&p.to_string_lossy(), 0, FILE_FLAG_BACKUP_SEMANTICS)?;
+        // SAFETY: zeroed is a valid BY_HANDLE_FILE_INFORMATION (plain data).
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: h is an open handle; info is writable.
+        if unsafe { GetFileInformationByHandle(h.raw(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+    }
+
     /// FRN of the volume's root folder (works without admin).
     pub fn root_frn(drive: &str) -> io::Result<u64> {
         let h = open(&format!("{drive}\\"), 0, FILE_FLAG_BACKUP_SEMANTICS)?;
@@ -417,6 +474,25 @@ mod os {
         /// Opens the file or folder with this FRN for its security
         /// descriptor only (`READ_CONTROL`), never its contents.
         pub fn open_by_id(&self, frn: u64) -> io::Result<Handle> {
+            self.open_id(frn, READ_CONTROL, 0)
+        }
+
+        /// The names in the folder with this FRN, as creation records
+        /// (its listing only: no file is opened). Backup semantics read
+        /// any folder; what the index shows of them is still decided by
+        /// the owner rules and folder checks.
+        pub fn list_dir(&self, frn: u64) -> io::Result<Vec<UsnRecord>> {
+            // a link to a folder is opened itself, never followed: its
+            // target's entries are indexed at their own place
+            let h = self.open_id(
+                frn,
+                FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )?;
+            list_open_dir(&h, frn)
+        }
+
+        fn open_id(&self, frn: u64, access: u32, flags: u32) -> io::Result<Handle> {
             let id = FILE_ID_DESCRIPTOR {
                 dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
                 Type: FileIdType,
@@ -428,10 +504,10 @@ mod os {
                 OpenFileById(
                     self.h.raw(),
                     &id,
-                    READ_CONTROL,
+                    access,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     std::ptr::null(),
-                    FILE_FLAG_BACKUP_SEMANTICS,
+                    FILE_FLAG_BACKUP_SEMANTICS | flags,
                 )
             };
             if h == INVALID_HANDLE_VALUE {
@@ -477,6 +553,7 @@ mod tests {
             next_usn,
             root_frn: 5,
             records: vec![],
+            cut: Default::default(),
         }
     }
 
@@ -537,6 +614,53 @@ mod tests {
             Replay::From(1000),
             "nothing changed"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_lists_its_entries_with_their_ids() {
+        use super::os::*;
+        let dir = std::env::temp_dir().join(format!("flint-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Alt Klasör")).unwrap();
+        std::fs::write(dir.join("not.txt"), b"x").unwrap();
+        // enough entries for more than one buffer
+        for i in 0..900 {
+            std::fs::write(dir.join(format!("dosya-uzun-bir-ad-{i:04}.txt")), b"").unwrap();
+        }
+        let r = list_dir_at(&dir).unwrap();
+        assert_eq!(r.len(), 902);
+        let sub = r.iter().find(|r| r.name == "Alt Klasör").unwrap();
+        assert!(sub.is_dir() && sub.parent == 7);
+        assert_eq!(sub.frn, file_id(&dir.join("Alt Klasör")).unwrap());
+        assert!(
+            r.iter()
+                .any(|r| r.name == "not.txt" && !r.is_dir() && r.time > 0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link to a folder is not followed: none of its target's entries.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_link_is_not_followed() {
+        use super::os::*;
+        let dir = std::env::temp_dir().join(format!("flint-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("hedef")).unwrap();
+        std::fs::write(dir.join("hedef").join("gizli.txt"), b"x").unwrap();
+        let link = dir.join("bag");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(dir.join("hedef"))
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let r = list_dir_at(&link).unwrap_or_default();
+        assert!(!r.iter().any(|r| r.name == "gizli.txt"), "{r:?}");
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

@@ -79,6 +79,59 @@ pub fn user_scope(profile: PathBuf, include_app_data: bool) -> Scope {
     s
 }
 
+/// The user's app data folders (AppData\Local, \Roaming, \LocalLow)
+/// that exist.
+pub fn app_data_folders() -> Vec<PathBuf> {
+    [
+        &FOLDERID_LocalAppData,
+        &FOLDERID_RoamingAppData,
+        &FOLDERID_LocalAppDataLow,
+    ]
+    .into_iter()
+    .filter_map(|id| known(id).ok())
+    .filter(|p| p.is_dir())
+    .collect()
+}
+
+/// What the app walks itself beside the service, which leaves out the
+/// contents of every `app_data` folder: all of them when `include` (the
+/// "Search app data folders" setting), else the `extra` folders (Settings)
+/// inside one of them and the ones inside an `extra` folder, so a folder
+/// the user added is indexed in full, as in Basic mode.
+pub fn beside_service(app_data: &[PathBuf], include: bool, extra: &[PathBuf]) -> Vec<PathBuf> {
+    if include {
+        return app_data.to_vec();
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for f in extra {
+        if app_data.iter().any(|a| crate::walk::is_within(f, a)) {
+            out.push(f.clone());
+        }
+    }
+    for a in app_data {
+        if extra.iter().any(|f| crate::walk::is_within(a, f)) {
+            out.push(a.clone());
+        }
+    }
+    // a folder inside another listed one is walked with it; of the same
+    // folder spelled twice, the first is kept
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for (i, f) in out.iter().enumerate() {
+        let inside = out.iter().enumerate().any(|(j, g)| {
+            let same = crate::walk::is_within(f, g) && crate::walk::is_within(g, f);
+            if same {
+                j < i
+            } else {
+                crate::walk::is_within(f, g)
+            }
+        });
+        if !inside {
+            kept.push(f.clone());
+        }
+    }
+    kept
+}
+
 impl Scope {
     /// Also walks `extra`. A skipped folder inside one of them becomes a
     /// root as well, so a folder the user added is indexed in full.
@@ -98,6 +151,53 @@ impl Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beside_the_service_only_what_the_user_asked_for() {
+        let ad: Vec<PathBuf> = [r"C:\U\x\AppData\Local", r"C:\U\x\AppData\Roaming"]
+            .map(PathBuf::from)
+            .to_vec();
+        let p = |s: &[&str]| s.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(beside_service(&ad, true, &[]), ad);
+        assert!(beside_service(&ad, false, &[]).is_empty());
+        assert!(beside_service(&ad, false, &p(&[r"D:\Notes", r"C:\U\x\Documents"])).is_empty());
+        assert_eq!(
+            beside_service(
+                &ad,
+                false,
+                &p(&[r"c:\u\x\appdata\roaming\.minecraft", r"D:\Notes"])
+            ),
+            p(&[r"c:\u\x\appdata\roaming\.minecraft"])
+        );
+        assert_eq!(
+            beside_service(&ad, false, &p(&[r"C:\U\x"])),
+            ad,
+            "a folder holding app data"
+        );
+        assert_eq!(
+            beside_service(
+                &ad,
+                false,
+                &p(&[r"C:\U\x\AppData\Local\Game", r"C:\U\x\AppData"])
+            ),
+            ad,
+            "nothing twice"
+        );
+        assert_eq!(
+            beside_service(
+                &ad,
+                false,
+                &p(&[r"C:\U\x\AppData\Local", r"C:\U\x\AppData\Roaming"])
+            ),
+            p(&[r"C:\U\x\AppData\Local", r"C:\U\x\AppData\Roaming"]),
+            "an app data folder added itself"
+        );
+        assert_eq!(
+            beside_service(&ad, false, &p(&[r"c:\u\x\appdata\local"])),
+            p(&[r"c:\u\x\appdata\local"]),
+            "spelled another way, still once"
+        );
+    }
     use windows_sys::Win32::UI::Shell::{
         FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_Profile, FOLDERID_Programs,
         FOLDERID_RoamingAppData,

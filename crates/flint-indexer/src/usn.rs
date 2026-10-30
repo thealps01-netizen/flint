@@ -3,6 +3,7 @@
 //! fill. Pure: the caller does the I/O.
 
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 pub const USN_REASON_FILE_CREATE: u32 = 0x100;
 pub const USN_REASON_FILE_DELETE: u32 = 0x200;
 pub const USN_REASON_SECURITY_CHANGE: u32 = 0x800;
@@ -181,9 +182,128 @@ pub fn parse_read_output(buf: &[u8]) -> Result<(i64, Vec<UsnRecord>), UsnError> 
     cursor(buf).map(|(u, r)| (u as i64, r))
 }
 
+/// Offsets in a `FILE_ID_BOTH_DIR_INFO` entry (what
+/// `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` lists).
+mod dir_info {
+    pub const NEXT: usize = 0;
+    pub const LAST_WRITE: usize = 24;
+    pub const ATTRS: usize = 56;
+    pub const NAME_LEN: usize = 60;
+    pub const FILE_ID: usize = 96;
+    pub const NAME: usize = 104;
+}
+
+/// The entries of one folder listing (`FILE_ID_BOTH_DIR_INFO` entries
+/// chained by their next offset) as creation records under `parent`;
+/// `.` and `..` are left out. The file id is the FRN on NTFS.
+pub fn parse_dir_info(buf: &[u8], parent: u64) -> Result<Vec<UsnRecord>, UsnError> {
+    use dir_info::*;
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    loop {
+        let e = buf.get(at..).ok_or(UsnError::Truncated)?;
+        if e.len() < NAME {
+            return Err(UsnError::Truncated);
+        }
+        let nl = u32_at(e, NAME_LEN) as usize;
+        if NAME + nl > e.len() || !nl.is_multiple_of(2) {
+            return Err(UsnError::Truncated);
+        }
+        let units: Vec<u16> = e[NAME..NAME + nl]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let name = String::from_utf16_lossy(&units);
+        if name != "." && name != ".." {
+            out.push(UsnRecord {
+                frn: u64_at(e, FILE_ID),
+                parent,
+                usn: 0,
+                time: filetime_to_unix(u64_at(e, LAST_WRITE) as i64),
+                reason: USN_REASON_FILE_CREATE,
+                attrs: u32_at(e, ATTRS),
+                security_id: 0,
+                name,
+            });
+        }
+        match u32_at(e, NEXT) as usize {
+            0 => return Ok(out),
+            n if n < NAME || !n.is_multiple_of(8) => return Err(UsnError::BadLength(n as u32)),
+            n => at += n,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn dir_entry(next: u32, id: u64, attrs: u32, name: &str) -> Vec<u8> {
+        let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut e = vec![0u8; 104];
+        e[0..4].copy_from_slice(&next.to_le_bytes());
+        e[24..32].copy_from_slice(&116_444_736_100_000_000u64.to_le_bytes()); // 1970 + 10 s
+        e[56..60].copy_from_slice(&attrs.to_le_bytes());
+        e[60..64].copy_from_slice(&(units.len() as u32).to_le_bytes());
+        e[96..104].copy_from_slice(&id.to_le_bytes());
+        e.extend(units);
+        if next != 0 {
+            e.resize(next as usize, 0);
+        }
+        e
+    }
+
+    #[test]
+    fn folder_listing_parses_and_skips_dot_entries() {
+        let mut buf = dir_entry(112, 1, FILE_ATTRIBUTE_DIRECTORY, ".");
+        buf.extend(dir_entry(112, 2, FILE_ATTRIBUTE_DIRECTORY, ".."));
+        buf.extend(dir_entry(
+            120,
+            0x0001_0000_0000_0042,
+            FILE_ATTRIBUTE_DIRECTORY,
+            "Bütçe",
+        ));
+        buf.extend(dir_entry(0, 0x43, 0x20, "rapor.txt"));
+        let r = parse_dir_info(&buf, 7).unwrap();
+        assert_eq!(
+            r.iter()
+                .map(|r| (r.frn, r.name.as_str(), r.is_dir(), r.parent, r.time))
+                .collect::<Vec<_>>(),
+            [
+                (0x0001_0000_0000_0042, "Bütçe", true, 7, 10),
+                (0x43, "rapor.txt", false, 7, 10)
+            ]
+        );
+        assert!(r.iter().all(|r| r.reason == USN_REASON_FILE_CREATE));
+        // damage is reported, not read past
+        assert!(matches!(
+            parse_dir_info(&buf[..buf.len() - 2], 7),
+            Err(UsnError::Truncated)
+        ));
+        let mut bad = buf.clone();
+        bad[0..4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(matches!(
+            parse_dir_info(&bad, 7),
+            Err(UsnError::BadLength(3))
+        ));
+        assert!(matches!(parse_dir_info(&[], 7), Err(UsnError::Truncated)));
+    }
+
+    /// The offsets match Windows' own structure.
+    #[cfg(windows)]
+    #[test]
+    fn dir_info_offsets_match_windows() {
+        use std::mem::offset_of;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ID_BOTH_DIR_INFO as I;
+        assert_eq!(offset_of!(I, NextEntryOffset), dir_info::NEXT);
+        assert_eq!(offset_of!(I, LastWriteTime), dir_info::LAST_WRITE);
+        assert_eq!(offset_of!(I, FileAttributes), dir_info::ATTRS);
+        assert_eq!(offset_of!(I, FileNameLength), dir_info::NAME_LEN);
+        assert_eq!(offset_of!(I, FileId), dir_info::FILE_ID);
+        assert_eq!(offset_of!(I, FileName), dir_info::NAME);
+    }
 
     fn put16(b: &mut [u8], at: usize, v: u16) {
         b[at..at + 2].copy_from_slice(&v.to_le_bytes());

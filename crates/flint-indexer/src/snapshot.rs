@@ -36,6 +36,9 @@ pub struct VolumeSnapshot {
     /// Only `frn`, `parent`, `time`, `attrs` (directory bit) and `name`
     /// are kept; `usn` and `reason` are zero.
     pub records: Vec<UsnRecord>,
+    /// What the volume leaves out (kept in the index image, not in the
+    /// user-mode snapshot file, whose volumes leave nothing out).
+    pub cut: crate::cut::Cut,
 }
 
 #[derive(Debug)]
@@ -65,7 +68,8 @@ impl std::error::Error for SnapshotError {}
 
 /// Magic of an index image file (the service's warm start).
 pub const IMAGE_MAGIC: &[u8; 8] = b"FLNTIMG\0";
-pub const IMAGE_VERSION: u32 = 1;
+/// 2: each volume also keeps what it leaves out (`crate::cut`).
+pub const IMAGE_VERSION: u32 = 2;
 
 /// A volume's journal position and FRN map in an image.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +114,23 @@ pub fn encode_image(ix: &Index, vols: &[VolumeImage]) -> Vec<u8> {
         p.extend_from_slice(&(v.parts.frns.len() as u64).to_le_bytes());
         for &(id, frn) in &v.parts.frns {
             p.extend_from_slice(&id.to_le_bytes());
+            p.extend_from_slice(&frn.to_le_bytes());
+        }
+        p.extend_from_slice(&(v.parts.rules.len() as u32).to_le_bytes());
+        for rule in &v.parts.rules {
+            p.push(rule.depth);
+            p.extend_from_slice(&(rule.path.len() as u32).to_le_bytes());
+            for name in &rule.path {
+                put_str(&mut p, name);
+            }
+        }
+        p.extend_from_slice(&(v.parts.cut.len() as u64).to_le_bytes());
+        for &(frn, depth) in &v.parts.cut {
+            p.extend_from_slice(&frn.to_le_bytes());
+            p.push(depth);
+        }
+        p.extend_from_slice(&(v.parts.hidden.len() as u64).to_le_bytes());
+        for &frn in &v.parts.hidden {
             p.extend_from_slice(&frn.to_le_bytes());
         }
     }
@@ -170,6 +191,43 @@ pub fn decode_image(bytes: &[u8]) -> Result<(Index, Vec<VolumeImage>), SnapshotE
             let id = r.u32()?;
             frns.push((id, r.u64()?));
         }
+        let mut rules = Vec::new();
+        for _ in 0..r.u32()? {
+            let depth = r.u8()?;
+            if depth as usize > crate::cut::KEEP.len() {
+                return Err(SnapshotError::Checksum);
+            }
+            let n = r.u32()?;
+            if n as usize > payload.len() - r.at {
+                return Err(SnapshotError::Truncated);
+            }
+            let mut path = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                path.push(r.str()?);
+            }
+            rules.push(crate::cut::Rule { path, depth });
+        }
+        let count = r.u64()?;
+        if count > ((payload.len() - r.at) / 9) as u64 {
+            return Err(SnapshotError::Truncated);
+        }
+        let mut cut = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let frn = r.u64()?;
+            let depth = r.u8()?;
+            if depth as usize > crate::cut::KEEP.len() {
+                return Err(SnapshotError::Checksum);
+            }
+            cut.push((frn, depth));
+        }
+        let count = r.u64()?;
+        if count > ((payload.len() - r.at) / 8) as u64 {
+            return Err(SnapshotError::Truncated);
+        }
+        let mut hidden = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            hidden.push(r.u64()?);
+        }
         vols.push(VolumeImage {
             drive,
             volume_serial,
@@ -180,6 +238,9 @@ pub fn decode_image(bytes: &[u8]) -> Result<(Index, Vec<VolumeImage>), SnapshotE
                 root,
                 orphans,
                 frns,
+                rules,
+                cut,
+                hidden,
             },
         });
     }
@@ -218,6 +279,7 @@ pub fn capture(
         next_usn,
         root_frn: v.root_frn(),
         records,
+        cut: v.cut().clone(),
     }
 }
 
@@ -258,6 +320,7 @@ pub fn capture_walk(ix: &Index) -> Vec<VolumeSnapshot> {
                     next_usn: 0,
                     root_frn: id.0 as u64 + 1,
                     records: Vec::new(),
+                    cut: crate::cut::Cut::default(),
                 },
             ));
             continue;
@@ -287,6 +350,7 @@ pub fn capture_walk(ix: &Index) -> Vec<VolumeSnapshot> {
                         next_usn: 0,
                         root_frn: root.0 as u64 + 1,
                         records: vec![rec],
+                        cut: crate::cut::Cut::default(),
                     },
                 ));
             }
@@ -324,7 +388,8 @@ pub fn restore_owned(ix: &mut Index, s: VolumeSnapshot) -> VolumeIndex {
             }
         })
         .collect();
-    let v = VolumeIndex::build(ix, &s.drive, s.root_frn, s.records);
+    let mut v = VolumeIndex::build(ix, &s.drive, s.root_frn, s.records);
+    v.set_cut(s.cut);
     for (frn, mark) in marks {
         if let Some(id) = v.id(frn) {
             ix.set_restriction(id, Some(mark));
@@ -383,6 +448,9 @@ impl<'a> Reader<'a> {
     }
     fn arr<const N: usize>(&mut self) -> Result<[u8; N], SnapshotError> {
         Ok(self.take(N)?.try_into().expect("N bytes"))
+    }
+    fn u8(&mut self) -> Result<u8, SnapshotError> {
+        Ok(self.take(1)?[0])
     }
     fn u16(&mut self) -> Result<u16, SnapshotError> {
         self.arr().map(u16::from_le_bytes)
@@ -467,6 +535,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<VolumeSnapshot>, SnapshotError> {
             next_usn,
             root_frn,
             records,
+            cut: crate::cut::Cut::default(),
         });
     }
     if r.at != payload.len() {
@@ -634,6 +703,20 @@ mod tests {
         let mut va = VolumeIndex::build(&mut a, "C:", ROOT, volume(300));
         a.set_restriction(va.id(100).unwrap(), Some(Restriction::NoList));
         va.apply(&mut a, &rec(5000, 100, "yeni-dosya.txt", false, 1));
+        // what the volume leaves out comes back too
+        va.set_cut(crate::cut::Cut::from_parts(
+            vec![crate::cut::Rule {
+                path: vec![
+                    "users".into(),
+                    "*".into(),
+                    "appdata".into(),
+                    "roaming".into(),
+                ],
+                depth: 0,
+            }],
+            &[(100, 0), (101, 3)],
+            &[7000, 7001],
+        ));
         let img = VolumeImage {
             drive: "C:".into(),
             volume_serial: 7,
@@ -645,6 +728,12 @@ mod tests {
         let (mut b, vols) = decode_image(&bytes).unwrap();
         assert_eq!(vols, vec![img.clone()]);
         let mut vb = VolumeIndex::from_parts(&b, vols[0].parts.clone()).unwrap();
+        assert_eq!(vb.cut(), va.cut());
+        // compaction copies a volume through capture and restore: what it
+        // leaves out goes along
+        let mut c = Index::new();
+        let vc = restore_owned(&mut c, capture(&va, &a, "C:", 1, 2, 3));
+        assert_eq!(vc.cut(), va.cut());
         assert_eq!(sorted_paths(&a), sorted_paths(&b));
         assert_eq!(vb.id(5000), va.id(5000));
         assert_eq!(
@@ -661,6 +750,10 @@ mod tests {
         bad[k] ^= 1;
         assert!(matches!(decode_image(&bad), Err(SnapshotError::Checksum)));
         assert!(matches!(decode(&bytes), Err(SnapshotError::BadMagic)));
+        // an image of an older version is refused (read again from the disk)
+        let mut old = bytes.clone();
+        old[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(decode_image(&old), Err(SnapshotError::Version(1))));
         // parts that do not fit the index are refused
         let mut wrong = img.parts.clone();
         wrong.root = EntryId(b.raw_len() as u32 + 5);
