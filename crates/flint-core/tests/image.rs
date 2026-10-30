@@ -86,10 +86,8 @@ fn a_damaged_image_is_refused() {
         assert!(Index::from_image(&img[..cut]).is_err(), "cut at {cut}");
     }
     let n = a.raw_len();
-    let names_len = u64::from_le_bytes(img[8..16].try_into().unwrap()) as usize;
-    let folded_at = 16 + names_len;
-    let folded_len = u64::from_le_bytes(img[folded_at..folded_at + 8].try_into().unwrap()) as usize;
-    let cols = folded_at + 8 + folded_len;
+    let text_len = u64::from_le_bytes(img[8..16].try_into().unwrap()) as usize;
+    let cols = 16 + text_len;
     // name offset past the text
     let mut bad = img.clone();
     bad[cols..cols + 4].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -97,8 +95,8 @@ fn a_damaged_image_is_refused() {
         Index::from_image(&bad).err().unwrap(),
         ImageError::Invalid("name outside the text")
     );
-    // parent column: name_off 4n, name_len 2n, fold_off 4n, fold_len 2n
-    let parents = cols + 12 * n;
+    // parent column: text_off 4n, name_len 2n, fold_len 2n
+    let parents = cols + 8 * n;
     let set_parent = |img: &mut Vec<u8>, i: usize, p: u32| {
         img[parents + 4 * i..parents + 4 * i + 4].copy_from_slice(&p.to_le_bytes());
     };
@@ -122,6 +120,40 @@ fn a_damaged_image_is_refused() {
     );
 }
 
+/// An image saved by Flint 0.1.3 (names and folded names apart) still
+/// loads, so an update starts warm; equal names come back stored once.
+#[test]
+fn an_image_from_0_1_3_loads() {
+    let a = sample();
+    let mut img = vec![1, 2, 3];
+    a.to_image_v2(&mut img);
+    img.extend_from_slice(b"tail");
+    // its layout: n, names, folded names, name_off 4n, name_len 2n,
+    // fold_off 4n, fold_len 2n, parents 4n, then one flag byte an entry,
+    // which never held the "stored once" bit (8)
+    let at = |o: usize| u64::from_le_bytes(img[3 + o..11 + o].try_into().unwrap()) as usize;
+    let n = at(0);
+    let folded = 8 + 8 + at(8);
+    let flags = folded + 8 + at(folded) + 16 * n;
+    assert!(img[3 + flags..3 + flags + n].iter().all(|f| f & 8 == 0));
+    assert!(img[3 + flags..3 + flags + n].iter().any(|f| f & 1 != 0));
+    let (b, used) = Index::from_image_v2(&img[3..]).unwrap();
+    assert_eq!(&img[3 + used..], b"tail");
+    same(&a, &b);
+    b.check_tree().unwrap();
+    // every entry's current name (dead ones keep theirs), each equal
+    // pair once; the text the rename left behind is dropped
+    let live: Vec<EntryId> = (0..b.raw_len() as u32).map(EntryId).collect();
+    let once: usize = live
+        .iter()
+        .map(|&id| {
+            let (n, f) = (b.name(id), b.folded(id));
+            n.len() + if n == f { 0 } else { f.len() }
+        })
+        .sum();
+    assert_eq!(b.text_bytes(), once);
+}
+
 #[test]
 fn garbage_ratio_counts_left_over_names() {
     let mut ix = Index::new();
@@ -129,6 +161,8 @@ fn garbage_ratio_counts_left_over_names() {
     let f = file(&mut ix, "aaaaaaaa", c);
     assert!(ix.garbage_ratio() < 0.01);
     ix.rename(f, "bbbbbbbb", None);
+    // "C:" + "c:" + "aaaaaaaa" (stored once) left behind by the rename:
+    // 8 of 20 bytes
     let g = ix.garbage_ratio();
-    assert!(g > 0.4 && g < 0.5, "{g}");
+    assert!((g - 0.4).abs() < 0.01, "{g}");
 }

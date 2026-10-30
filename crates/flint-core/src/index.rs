@@ -229,17 +229,20 @@ pub(crate) const F_DIR: u8 = 1;
 pub(crate) const F_DEAD: u8 = 2;
 /// The original name has a camelCase word start (`fold::has_camel`).
 const F_CAMEL: u8 = 4;
+/// The folded name equals the original, which is stored once.
+const F_SAME: u8 = 8;
 
-/// Parallel-vector storage. Original and folded names live in two
-/// append-only arenas addressed by (offset, len). A rename appends new
-/// text; the old bytes stay as garbage (reported by `heap_bytes`).
+/// Parallel-vector storage. Names live in one append-only text: each
+/// entry's folded form at `text_off` (what search scans), then its
+/// original, unless the two are equal ([`F_SAME`], most names), when it
+/// is stored once. A rename
+/// appends new text; the old bytes stay as garbage (see
+/// [`Index::garbage_ratio`]).
 #[derive(Default)]
 pub struct Index {
-    names: String,
-    folded: String,
-    name_off: Vec<u32>,
+    text: String,
+    text_off: Vec<u32>,
     name_len: Vec<u16>,
-    fold_off: Vec<u32>,
     fold_len: Vec<u16>,
     parent: Vec<u32>,
     flags: Vec<u8>,
@@ -295,18 +298,25 @@ pub fn grow_col<T: Clone>(v: &mut Vec<T>, len: usize, fill: T) {
     }
 }
 
-fn push_arena(arena: &mut String, s: &str) -> (u32, u16) {
-    let off = arena.len();
-    assert!(s.len() <= u16::MAX as usize, "name longer than 65535 bytes");
+/// Appends `folded`, then `name` unless it equals `folded`; returns the
+/// offset and whether the two are equal ([`F_SAME`]).
+fn push_text(text: &mut String, name: &str, folded: &str) -> (u32, bool) {
+    let off = text.len();
+    let same = name == folded;
+    let add = name.len() + if same { 0 } else { folded.len() };
     assert!(
-        off + s.len() <= u32::MAX as usize,
-        "name arena exceeds 4 GiB"
+        name.len().max(folded.len()) <= u16::MAX as usize,
+        "name longer than 65535 bytes"
     );
-    if off + s.len() > arena.capacity() {
-        arena.reserve_exact(room(off, 64 * 1024).max(s.len()));
+    assert!(off + add <= u32::MAX as usize, "name text exceeds 4 GiB");
+    if off + add > text.capacity() {
+        text.reserve_exact(room(off, 64 * 1024).max(add));
     }
-    arena.push_str(s);
-    (off as u32, s.len() as u16)
+    text.push_str(folded);
+    if !same {
+        text.push_str(name);
+    }
+    (off as u32, same)
 }
 
 /// Folded name of the Cache Directory Tagging marker file.
@@ -320,11 +330,12 @@ impl Index {
     /// Room for exactly `n` more entries (a scan inserts millions at
     /// once; `Vec::reserve` would double columns already full).
     pub fn reserve(&mut self, n: usize) {
-        self.names.reserve_exact(n * 20);
-        self.folded.reserve_exact(n * 20);
-        self.name_off.reserve_exact(n);
+        // a name and, for a third of names, its folded form: 44 bytes an
+        // entry on a measured system drive (34-byte names, two thirds
+        // equal to their fold)
+        self.text.reserve_exact(n * 44);
+        self.text_off.reserve_exact(n);
         self.name_len.reserve_exact(n);
-        self.fold_off.reserve_exact(n);
         self.fold_len.reserve_exact(n);
         self.parent.reserve_exact(n);
         self.flags.reserve_exact(n);
@@ -376,21 +387,23 @@ impl Index {
             self.ensure_dir(p);
         }
         let id = EntryId(self.parent.len() as u32);
-        let (no, nl) = push_arena(&mut self.names, e.name);
         let folded = crate::fold::fold_str(e.name);
-        let (fo, fl) = push_arena(&mut self.folded, &folded);
+        let (off, same) = push_text(&mut self.text, e.name, &folded);
         push_col(&mut self.mask, crate::fold::char_mask(&folded));
-        push_col(&mut self.name_off, no);
-        push_col(&mut self.name_len, nl);
-        push_col(&mut self.fold_off, fo);
-        push_col(&mut self.fold_len, fl);
+        push_col(&mut self.text_off, off);
+        push_col(&mut self.name_len, e.name.len() as u16);
+        push_col(&mut self.fold_len, folded.len() as u16);
         push_col(&mut self.parent, e.parent.map_or(NONE, |p| p.0));
         let camel = if crate::fold::has_camel(e.name) {
             F_CAMEL
         } else {
             0
         };
-        push_col(&mut self.flags, if e.is_dir { F_DIR } else { 0 } | camel);
+        let same = if same { F_SAME } else { 0 };
+        push_col(
+            &mut self.flags,
+            if e.is_dir { F_DIR } else { 0 } | camel | same,
+        );
         push_col(&mut self.last_change, e.last_change);
         push_col(&mut self.child_count, 0);
         let drive = match e.parent {
@@ -438,18 +451,19 @@ impl Index {
         let i = id.0 as usize;
         let was_tag = self.is_live(id) && self.folded(id) == CACHEDIR_TAG;
         let old_parent = self.parent(id);
-        let (no, nl) = push_arena(&mut self.names, new_name);
         let folded = crate::fold::fold_str(new_name);
-        let (fo, fl) = push_arena(&mut self.folded, &folded);
+        let (off, same) = push_text(&mut self.text, new_name, &folded);
         self.mask[i] = crate::fold::char_mask(&folded);
-        self.flags[i] &= !F_CAMEL;
+        self.flags[i] &= !(F_CAMEL | F_SAME);
         if crate::fold::has_camel(new_name) {
             self.flags[i] |= F_CAMEL;
         }
-        self.name_off[i] = no;
-        self.name_len[i] = nl;
-        self.fold_off[i] = fo;
-        self.fold_len[i] = fl;
+        if same {
+            self.flags[i] |= F_SAME;
+        }
+        self.text_off[i] = off;
+        self.name_len[i] = new_name.len() as u16;
+        self.fold_len[i] = folded.len() as u16;
         if let Some(np) = new_parent
             && self.parent[i] != np.0
         {
@@ -505,14 +519,19 @@ impl Index {
 
     pub fn name(&self, id: EntryId) -> &str {
         let i = id.0 as usize;
-        let o = self.name_off[i] as usize;
-        &self.names[o..o + self.name_len[i] as usize]
+        let o = self.text_off[i] as usize;
+        let o = if self.flags[i] & F_SAME != 0 {
+            o
+        } else {
+            o + self.fold_len[i] as usize
+        };
+        &self.text[o..o + self.name_len[i] as usize]
     }
 
     pub fn folded(&self, id: EntryId) -> &str {
         let i = id.0 as usize;
-        let o = self.fold_off[i] as usize;
-        &self.folded[o..o + self.fold_len[i] as usize]
+        let o = self.text_off[i] as usize;
+        &self.text[o..o + self.fold_len[i] as usize]
     }
 
     pub fn parent(&self, id: EntryId) -> Option<EntryId> {
@@ -786,12 +805,16 @@ impl Index {
         self.parent.len()
     }
 
+    /// Test aid: bytes of name text held (live, dead and left over).
+    #[doc(hidden)]
+    pub fn text_bytes(&self) -> usize {
+        self.text.len()
+    }
+
     pub fn heap_bytes(&self) -> usize {
-        self.names.capacity()
-            + self.folded.capacity()
-            + self.name_off.capacity() * 4
+        self.text.capacity()
+            + self.text_off.capacity() * 4
             + self.name_len.capacity() * 2
-            + self.fold_off.capacity() * 4
             + self.fold_len.capacity() * 2
             + self.parent.capacity() * 4
             + self.flags.capacity()
@@ -864,6 +887,33 @@ fn put_col<const W: usize, T: Copy>(out: &mut Vec<u8>, v: &[T], f: fn(T) -> [u8;
     }
 }
 
+/// Whether `len` bytes at `off` lie in `t` on char boundaries.
+fn in_text(t: &str, off: usize, len: u16) -> bool {
+    let e = off + len as usize;
+    e <= t.len() && t.is_char_boundary(off) && t.is_char_boundary(e)
+}
+
+/// The image columns after the names (both layouts).
+struct Rest {
+    parent: Vec<u32>,
+    flags: Vec<u8>,
+    last_change: Vec<u32>,
+    drive: Vec<u8>,
+    mask: Vec<u32>,
+}
+
+impl Rest {
+    fn read(r: &mut Reader<'_>, n: usize) -> Result<Rest, ImageError> {
+        Ok(Rest {
+            parent: r.col(n, u32::from_le_bytes)?,
+            flags: r.col(n, |x: [u8; 1]| x[0])?,
+            last_change: r.col(n, u32::from_le_bytes)?,
+            drive: r.col(n, |x: [u8; 1]| x[0])?,
+            mask: r.col(n, u32::from_le_bytes)?,
+        })
+    }
+}
+
 impl Index {
     /// Appends the index's own state (names, structure, tags,
     /// restrictions; not the owner rules, which the caller sets again) as
@@ -872,14 +922,16 @@ impl Index {
     pub fn to_image(&self, out: &mut Vec<u8>) {
         let n = self.raw_len();
         out.extend_from_slice(&(n as u64).to_le_bytes());
-        for arena in [&self.names, &self.folded] {
-            out.extend_from_slice(&(arena.len() as u64).to_le_bytes());
-            out.extend_from_slice(arena.as_bytes());
-        }
-        put_col(out, &self.name_off, u32::to_le_bytes);
+        out.extend_from_slice(&(self.text.len() as u64).to_le_bytes());
+        out.extend_from_slice(self.text.as_bytes());
+        put_col(out, &self.text_off, u32::to_le_bytes);
         put_col(out, &self.name_len, u16::to_le_bytes);
-        put_col(out, &self.fold_off, u32::to_le_bytes);
         put_col(out, &self.fold_len, u16::to_le_bytes);
+        self.put_rest(out);
+    }
+
+    /// The columns and tables after the names, the same in both layouts.
+    fn put_rest(&self, out: &mut Vec<u8>) {
         put_col(out, &self.parent, u32::to_le_bytes);
         put_col(out, &self.flags, |x: u8| [x]);
         put_col(out, &self.last_change, u32::to_le_bytes);
@@ -905,11 +957,43 @@ impl Index {
         }
     }
 
-    /// Reads an index written by [`Index::to_image`] from the start of
-    /// `b`; returns it and the number of bytes read. Every offset, parent
-    /// and key is checked, so a damaged image is refused, never a panic
-    /// later. Owner rules start empty.
-    pub fn from_image(b: &[u8]) -> Result<(Index, usize), ImageError> {
+    /// Test aid: the image layout of Flint 0.1.3 and before (names and
+    /// folded names in two texts), which [`Index::from_image_v2`] reads.
+    #[doc(hidden)]
+    pub fn to_image_v2(&self, out: &mut Vec<u8>) {
+        let n = self.raw_len();
+        let ids = || (0..n as u32).map(EntryId);
+        let (mut names, mut folded) = (String::new(), String::new());
+        let (mut name_off, mut fold_off) = (Vec::new(), Vec::new());
+        for id in ids() {
+            name_off.push(names.len() as u32);
+            names.push_str(self.name(id));
+            fold_off.push(folded.len() as u32);
+            folded.push_str(self.folded(id));
+        }
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+        for t in [&names, &folded] {
+            out.extend_from_slice(&(t.len() as u64).to_le_bytes());
+            out.extend_from_slice(t.as_bytes());
+        }
+        put_col(out, &name_off, u32::to_le_bytes);
+        put_col(out, &self.name_len, u16::to_le_bytes);
+        put_col(out, &fold_off, u32::to_le_bytes);
+        put_col(out, &self.fold_len, u16::to_le_bytes);
+        let mut rest = Vec::new();
+        self.put_rest(&mut rest);
+        // 0.1.3 had no F_SAME bit: the flags follow the 4-byte parents
+        for f in &mut rest[4 * n..5 * n] {
+            *f &= !F_SAME;
+        }
+        out.extend_from_slice(&rest);
+    }
+
+    /// Reads an image of Flint 0.1.3 and before (see
+    /// [`Index::to_image_v2`]): names and folded names in two texts. The
+    /// names are copied into one text, each equal pair once; text left by
+    /// renames is dropped.
+    pub fn from_image_v2(b: &[u8]) -> Result<(Index, usize), ImageError> {
         let mut r = Reader { b, at: 0 };
         let n = r.len(u32::MAX as usize - 1)?;
         let names = r.text()?;
@@ -918,23 +1002,80 @@ impl Index {
         let name_len = r.col(n, u16::from_le_bytes)?;
         let fold_off = r.col(n, u32::from_le_bytes)?;
         let fold_len = r.col(n, u16::from_le_bytes)?;
-        let parent = r.col(n, u32::from_le_bytes)?;
-        let flags = r.col(n, |x: [u8; 1]| x[0])?;
-        let last_change = r.col(n, u32::from_le_bytes)?;
-        let drive = r.col(n, |x: [u8; 1]| x[0])?;
-        let mask = r.col(n, u32::from_le_bytes)?;
-        let in_text = |t: &str, off: u32, len: u16| {
-            let (o, e) = (off as usize, off as usize + len as usize);
-            e <= t.len() && t.is_char_boundary(o) && t.is_char_boundary(e)
-        };
-        let mut live = 0;
-        let mut child_count = vec![0u32; n];
+        let mut rest = Rest::read(&mut r, n)?;
+        let mut size = 0usize;
         for i in 0..n {
-            if !in_text(&names, name_off[i], name_len[i])
-                || !in_text(&folded, fold_off[i], fold_len[i])
+            if !in_text(&names, name_off[i] as usize, name_len[i])
+                || !in_text(&folded, fold_off[i] as usize, fold_len[i])
             {
                 return Err(ImageError::Invalid("name outside the text"));
             }
+            size += name_len[i] as usize + fold_len[i] as usize;
+        }
+        if size > u32::MAX as usize {
+            return Err(ImageError::Invalid("name text exceeds 4 GiB"));
+        }
+        let mut text = String::with_capacity(size);
+        let mut offs = Vec::with_capacity(n);
+        for i in 0..n {
+            let (o, f) = (name_off[i] as usize, fold_off[i] as usize);
+            let name = &names[o..o + name_len[i] as usize];
+            let fold = &folded[f..f + fold_len[i] as usize];
+            let (off, same) = push_text(&mut text, name, fold);
+            offs.push(off);
+            rest.flags[i] = (rest.flags[i] & !F_SAME) | if same { F_SAME } else { 0 };
+        }
+        text.shrink_to_fit();
+        Self::assemble(r, n, text, offs, name_len, fold_len, rest)
+    }
+
+    /// Reads an index written by [`Index::to_image`] from the start of
+    /// `b`; returns it and the number of bytes read. Every offset, parent
+    /// and key is checked, so a damaged image is refused, never a panic
+    /// later. Owner rules start empty.
+    pub fn from_image(b: &[u8]) -> Result<(Index, usize), ImageError> {
+        let mut r = Reader { b, at: 0 };
+        let n = r.len(u32::MAX as usize - 1)?;
+        let text = r.text()?;
+        let text_off = r.col(n, u32::from_le_bytes)?;
+        let name_len = r.col(n, u16::from_le_bytes)?;
+        let fold_len = r.col(n, u16::from_le_bytes)?;
+        let rest = Rest::read(&mut r, n)?;
+        for i in 0..n {
+            let f = text_off[i] as usize;
+            let o = if rest.flags[i] & F_SAME != 0 {
+                f
+            } else {
+                f + fold_len[i] as usize
+            };
+            if !in_text(&text, f, fold_len[i]) || !in_text(&text, o, name_len[i]) {
+                return Err(ImageError::Invalid("name outside the text"));
+            }
+        }
+        Self::assemble(r, n, text, text_off, name_len, fold_len, rest)
+    }
+
+    /// Checks parents and tables and builds the index (names checked by
+    /// the caller).
+    fn assemble(
+        mut r: Reader<'_>,
+        n: usize,
+        text: String,
+        text_off: Vec<u32>,
+        name_len: Vec<u16>,
+        fold_len: Vec<u16>,
+        rest: Rest,
+    ) -> Result<(Index, usize), ImageError> {
+        let Rest {
+            parent,
+            flags,
+            last_change,
+            drive,
+            mask,
+        } = rest;
+        let mut live = 0;
+        let mut child_count = vec![0u32; n];
+        for i in 0..n {
             let p = parent[i];
             if p != NONE {
                 let p = p as usize;
@@ -994,11 +1135,9 @@ impl Index {
             restricted.insert(k, v);
         }
         let ix = Index {
-            names,
-            folded,
-            name_off,
+            text,
+            text_off,
             name_len,
-            fold_off,
             fold_len,
             parent,
             flags,
@@ -1020,9 +1159,16 @@ impl Index {
     pub fn garbage_ratio(&self) -> f64 {
         let used: usize = (0..self.raw_len())
             .filter(|&i| self.flags[i] & F_DEAD == 0)
-            .map(|i| self.name_len[i] as usize + self.fold_len[i] as usize)
+            .map(|i| {
+                self.name_len[i] as usize
+                    + if self.flags[i] & F_SAME != 0 {
+                        0
+                    } else {
+                        self.fold_len[i] as usize
+                    }
+            })
             .sum();
-        let total = self.names.len() + self.folded.len();
+        let total = self.text.len();
         if total == 0 {
             0.0
         } else {
@@ -1123,6 +1269,30 @@ mod tests {
         ix.reserve(100);
         let cap = ix.parent.capacity();
         assert!(cap >= n + 100 && cap < n + 100 + n / 8, "{n} -> {cap}");
+    }
+
+    /// Most names (a lowercase ASCII name) equal their folded form: the
+    /// text is kept once for them, twice only when the two differ.
+    #[test]
+    fn a_name_equal_to_its_fold_is_stored_once() {
+        let mut ix = Index::new();
+        let c = dir(&mut ix, "C:", None);
+        let before = ix.text_bytes();
+        let a = file(&mut ix, "readme.txt", c, 0);
+        assert_eq!(ix.text_bytes() - before, "readme.txt".len());
+        let b = file(&mut ix, "Bütçe.xlsx", c, 0);
+        assert_eq!(
+            ix.text_bytes() - before,
+            "readme.txt".len() + "Bütçe.xlsx".len() + "butce.xlsx".len()
+        );
+        assert_eq!((ix.name(a), ix.folded(a)), ("readme.txt", "readme.txt"));
+        assert_eq!((ix.name(b), ix.folded(b)), ("Bütçe.xlsx", "butce.xlsx"));
+        // a rename moves an entry between the two forms
+        ix.rename(a, "ReadMe.txt", None);
+        ix.rename(b, "butce.xlsx", None);
+        assert_eq!((ix.name(a), ix.folded(a)), ("ReadMe.txt", "readme.txt"));
+        assert_eq!((ix.name(b), ix.folded(b)), ("butce.xlsx", "butce.xlsx"));
+        assert_eq!(ix.camel_source(a), "ReadMe.txt");
     }
 
     #[test]

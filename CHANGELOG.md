@@ -3,6 +3,25 @@
 All notable changes to Flint are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.4 — 2026-10-30
+
+- The index takes about a quarter less memory, with nothing left out.
+  Two thirds of file names are already lowercase plain letters, so their
+  search form (lowercase, Turkish letters and accents folded) is the
+  name itself: it is now kept once instead of twice. The table that
+  follows files by their NTFS file number keeps a 4-byte key instead of
+  8; a file number shared by two files (a reused record whose delete
+  was missed) goes to a small second table, so both are still told
+  apart. On the measured disk (C:'s 1.70 M entries, names read without
+  administrator rights and built the way the service builds it) the
+  private memory after a first index went from 233 MB to 174 MB and
+  after a start from 225 MB to 163 MB; the saved index from 172 MB to
+  127 MB, and loading it from 0.17–0.22 s to 0.13–0.16 s. Searching
+  takes about 3 % longer (median 3.47–3.66 ms before, 3.63–4.01 ms
+  after, on the 2 M-entry test corpus with the privacy filter on).
+- The index saved by an earlier version is read and converted on the
+  first start after the update, so there is no new full scan.
+
 ## 0.1.3 — 2026-10-30
 
 - The index commits less memory once files change after a start. Its
