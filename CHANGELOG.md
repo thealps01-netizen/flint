@@ -16,7 +16,10 @@ All notable changes to Flint are listed here. Versions follow
   The memory actually in use (working set) was the same before and after.
   Adding entries one by one without reserving room first (a folder walk)
   takes about 1.5 times as long, about 10 ms for Basic mode's 151 k
-  entries.
+  entries. Measured after the update on the same PC, the Full indexing
+  service committed 243–246 MB after a first index and after a restart
+  alike (see
+  [everything-comparison.md](docs/benchmarks/everything-comparison.md)).
 
 ## 0.1.2 — 2026-10-30
 

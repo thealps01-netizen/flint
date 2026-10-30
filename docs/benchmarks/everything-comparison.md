@@ -1,6 +1,7 @@
 # Flint and Everything, side by side
 
-What this file is: one measured comparison of Flint 0.1.2 with
+What this file is: one measured comparison of Flint 0.1.2 (and Flint
+Full again in 0.1.3) with
 [Everything](https://www.voidtools.com/) 1.4.1.1032 on the same machine,
 the same day, in each of Flint's two modes. It records what was
 measured, how, and where the two are not alike. It is not a general
@@ -10,7 +11,8 @@ verdict: one PC, one disk, one set of searches.
 
 - CPU: AMD Ryzen 9 9900X, 12 cores / 24 threads; RAM 31 GiB
 - Windows 11 Pro, build 26300; C: NTFS on an NVMe SSD (D: ReFS, left out)
-- Measured 2026-10-30, with the released Flint 0.1.2 installer
+- Measured 2026-10-30, with the released Flint 0.1.2 installer; Flint
+  Full measured again the same day with the released 0.1.3 installer
 - Flint search history not used (no boosts); Everything with its default
   settings unless noted
 
@@ -37,7 +39,8 @@ process's working set / private bytes 5 s after the run.
 |---|---|---|---|---|
 | Flint Basic | 151,618 | 3.0–5.1 s | 0.12 s | 25 / 22–26 MB |
 | Everything, same folders | 153,523 | 4.3–4.4 s | 0.10–0.12 s | 29–31 / 16–18 MB |
-| Flint Full | 1,450,240–1,451,815 | 26.7–39.5 s | 0.33 s | 231–239 / 310–392 MB |
+| Flint Full 0.1.2 | 1,450,240–1,451,815 | 26.7–39.5 s | 0.33 s | 231–239 / 310–392 MB |
+| Flint Full 0.1.3 | 1,451,824 | 34.4–40.8 s | 0.30–0.32 s | 231–237 / 243–246 MB |
 | Everything, C: | 4,097,124 | 18.1–20.0 s | 1.15–1.16 s | 370–377 / 359–366 MB |
 | Everything, C: without app data | 1,750,283 | 10.6–12.5 s | 0.46–2.16 s | 182–187 / 170–176 MB |
 
@@ -49,19 +52,22 @@ How to read it:
 - **Whole C:, first index:** Everything builds it in less time and uses
   less memory per entry: 109–112 bytes per entry without app data (96
   with it) against Flint Full's 167–173 bytes of working set; in private
-  bytes 102–105 against 224–283. Flint Full's first index includes
+  bytes 102–105 against 176–178 (0.1.3; 224–283 in 0.1.2). Flint Full's
+  first index includes
   Flint's folder permission checks (see
   [indexer-baseline.md](indexer-baseline.md)), which Everything does not
   make.
-- **Whole C:, restart:** Flint Full answers 0.33 s after the service
-  starts with its saved index, in all three runs; Everything without app
-  data took 0.46–2.16 s with its saved database (1.15 s with all of C:).
-- **Flint Full's private memory is higher after a restart** (383–392 MB)
-  than after a first index (310–312 MB), with the same entries and the
-  same working set. The cause: the index's columns grew by doubling,
-  and after a restart every column is exactly full, so the first new
-  file doubled them all. Fixed in 0.1.3 (see the changelog); these runs
-  are 0.1.2 and were not repeated.
+- **Whole C:, restart:** Flint Full answers 0.30–0.33 s after the
+  service starts with its saved index, in all six runs; Everything
+  without app data took 0.46–2.16 s with its saved database (1.15 s with
+  all of C:).
+- **Flint Full's private memory in 0.1.2 was higher after a restart**
+  (383–392 MB) than after a first index (310–312 MB), with the same
+  entries and the same working set. The cause: the index's columns grew
+  by doubling, and after a restart every column is exactly full, so the
+  first new file doubled them all. 0.1.3 grows them by an eighth (see
+  the changelog): 243–246 MB after a first index and after a restart
+  alike. Flint Basic was not measured again in 0.1.3.
 - **Entries differ on C:** Everything lists every name on the volume to
   every user; Flint Full hides what the signed-in user cannot open (other
   profiles, restricted system folders). Everything's exclude list also
@@ -71,7 +77,7 @@ How to read it:
 
 ### How Flint Full was measured
 
-Three first-index runs and three restarts:
+In 0.1.2, three first-index runs and three restarts:
 
 - Run 1, without administrator rights: full indexing was turned off and
   on again in Flint's Settings while a script polled. Timed from the
@@ -85,8 +91,11 @@ Three first-index runs and three restarts:
   50 ms until `C: live` (39.5 s and 26.7 s; restarts 0.33 s each).
   Working set and private bytes from `Get-Process`, 10 s and 60 s after.
 
+In 0.1.3 the same elevated script ran again after the update: two
+first-index runs (40.8 s and 34.4 s) and three restarts (0.30–0.32 s).
+
 Between the runs the system's file cache was warm in different ways; the
-spread of the first index (26.7–39.5 s) is that.
+spread of the first index (26.7–40.8 s over both versions) is that.
 
 ### How Everything was run
 
