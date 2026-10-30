@@ -99,8 +99,9 @@ Two targets are **not** met yet and are listed with their causes in
 memory (about 660 MB private for 3.5 M entries; target 200 MB) and the
 cost of folder permission checks during the first index. Since 0.1.2 the
 service leaves out app data folders: on the measured PC it holds 1.45 M
-entries in a 238 MB working set and is ready 33.7 s after it starts
-(0.1.1: 3.46 M entries, 424 MB), measured in
+entries in a 231–239 MB working set, builds its first index in
+26.7–39.5 s and answers 0.33 s after a restart (0.1.1: 3.46 M entries,
+424 MB), measured in
 [everything-comparison.md](docs/benchmarks/everything-comparison.md).
 
 ### Compared with Everything
@@ -112,8 +113,9 @@ In short:
 
 - Over the same folders (Basic mode) the two start and use memory about
   the same.
-- Over the whole of C: (Full indexing) Everything indexes faster and uses
-  less memory per entry.
+- Over the whole of C: (Full indexing) Everything builds its first index
+  in less time and uses less memory per entry; after a restart Flint
+  answered in 0.33 s, Everything in 0.46–2.16 s.
 - Flint found all 17 test searches (13 as the first result); Everything
   found 12 (6–8 first), missing every search with a typo.
 - Search speed was not compared: Everything's command-line client does
