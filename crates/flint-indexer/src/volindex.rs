@@ -8,6 +8,7 @@ use crate::usn::{
 };
 use flint_core::{EntryId, EntryInput, Index};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 /// FRNs are local file-system numbers, not attacker-chosen keys, so a
 /// multiply-shift hash replaces SipHash (the map is hit for every entry
@@ -49,7 +50,13 @@ pub struct VolumeIndex {
     root: EntryId,
     /// The [`ORPHANS`] folder, created on first use.
     orphans: Option<EntryId>,
-    map: FrnMap<u64, EntryId>,
+    /// An FRN's low 32 bits (its MFT record number: NTFS holds fewer
+    /// than 2^32 files) -> entry, whose own FRN in `frn_of` must match,
+    /// sequence number included: 8 bytes a slot, not 16.
+    map: FrnMap<u32, EntryId>,
+    /// The FRNs whose key in `map` another FRN holds (a reused record
+    /// whose delete was missed). Normally empty.
+    other: FrnMap<u64, EntryId>,
     /// FRN of each entry id this volume owns (`u64::MAX` = not ours/dead).
     frn_of: Vec<u64>,
     /// The folders whose contents are left out.
@@ -57,6 +64,11 @@ pub struct VolumeIndex {
 }
 
 const NO_FRN: u64 = u64::MAX;
+
+/// The key of `frn` in [`VolumeIndex::map`].
+fn record(frn: u64) -> u32 {
+    frn as u32
+}
 
 /// What an index image keeps of a volume besides the entries.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,16 +123,21 @@ impl VolumeIndex {
             root: p.root,
             orphans: p.orphans,
             map: FrnMap::with_capacity_and_hasher(p.frns.len(), Default::default()),
+            other: FrnMap::default(),
             frn_of: vec![NO_FRN; n],
             cut: Cut::from_parts(p.rules, &p.cut, &p.hidden),
         };
         for (id, frn) in p.frns {
-            if id as usize >= n || frn == NO_FRN || v.map.insert(frn, EntryId(id)).is_some() {
+            if id as usize >= n
+                || frn == NO_FRN
+                || v.id(frn).is_some()
+                || v.frn_of[id as usize] != NO_FRN
+            {
                 return None;
             }
-            v.frn_of[id as usize] = frn;
+            v.bind(frn, EntryId(id));
         }
-        (v.map.get(&p.root_frn) == Some(&p.root)).then_some(v)
+        (v.id(p.root_frn) == Some(p.root)).then_some(v)
     }
 
     /// Adds the volume root `drive` ("C:") and every record to `ix`.
@@ -145,6 +162,7 @@ impl VolumeIndex {
             root,
             orphans: None,
             map: FrnMap::with_capacity_and_hasher(records.size_hint().0 + 1, Default::default()),
+            other: FrnMap::default(),
             frn_of: Vec::with_capacity(ix.raw_len() + records.size_hint().0),
             cut: Cut::default(),
         };
@@ -160,10 +178,10 @@ impl VolumeIndex {
             let parent = if r.parent == root_frn {
                 Some(root)
             } else {
-                v.map.get(&r.parent).copied()
+                v.id(r.parent)
             };
             match parent {
-                Some(p) if !v.map.contains_key(&r.frn) => {
+                Some(p) if v.id(r.frn).is_none() => {
                     v.insert(ix, &r, p);
                 }
                 _ => recs.push(r),
@@ -171,7 +189,7 @@ impl VolumeIndex {
         }
         // a repeated FRN keeps its last record
         let (repeats, recs): (Vec<UsnRecord>, Vec<UsnRecord>) =
-            recs.into_iter().partition(|r| v.map.contains_key(&r.frn));
+            recs.into_iter().partition(|r| v.id(r.frn).is_some());
         // record index by FRN; a repeated FRN keeps its last record
         let mut at: FrnMap<u64, u32> =
             FrnMap::with_capacity_and_hasher(recs.len(), Default::default());
@@ -193,7 +211,7 @@ impl VolumeIndex {
                 if p == root_frn {
                     break root;
                 }
-                if let Some(&id) = v.map.get(&p) {
+                if let Some(id) = v.id(p) {
                     break id;
                 }
                 match at.get(&p) {
@@ -246,8 +264,16 @@ impl VolumeIndex {
         if self.frn_of.len() <= i {
             flint_core::index::grow_col(&mut self.frn_of, i + 1, NO_FRN);
         }
+        debug_assert!(self.id(frn).is_none(), "FRN {frn:#x} bound twice");
         self.frn_of[i] = frn;
-        self.map.insert(frn, id);
+        match self.map.entry(record(frn)) {
+            Entry::Occupied(_) => {
+                self.other.insert(frn, id);
+            }
+            Entry::Vacant(e) => {
+                e.insert(id);
+            }
+        }
     }
 
     fn insert(&mut self, ix: &mut Index, r: &UsnRecord, parent: EntryId) -> EntryId {
@@ -262,7 +288,17 @@ impl VolumeIndex {
     }
 
     fn unbind(&mut self, ix: &mut Index, frn: u64) {
-        if let Some(id) = self.map.remove(&frn) {
+        let r = record(frn);
+        let in_map = self
+            .map
+            .get(&r)
+            .is_some_and(|x| self.frn_of[x.0 as usize] == frn);
+        let id = if in_map {
+            self.map.remove(&r)
+        } else {
+            self.other.remove(&frn)
+        };
+        if let Some(id) = id {
             ix.remove(id);
             self.frn_of[id.0 as usize] = NO_FRN;
         }
@@ -328,10 +364,9 @@ impl VolumeIndex {
             found
         };
         let inside: Vec<u64> = self
-            .map
-            .iter()
-            .filter(|&(_, &x)| x != id && inside_of(x))
-            .map(|(&f, _)| f)
+            .pairs()
+            .filter(|&(_, x)| x != id && inside_of(x))
+            .map(|(f, _)| f)
             .collect();
         for f in inside {
             if self.id(f).is_some_and(|x| ix.is_dir(x)) {
@@ -368,10 +403,9 @@ impl VolumeIndex {
                 // Windows deletes children first; a missed record must not
                 // leave live entries under a dead folder
                 let inside: Vec<u64> = self
-                    .map
-                    .iter()
-                    .filter(|&(_, &x)| x != id && ix.ancestors(x).any(|a| a == id))
-                    .map(|(&f, _)| f)
+                    .pairs()
+                    .filter(|&(_, x)| x != id && ix.ancestors(x).any(|a| a == id))
+                    .map(|(f, _)| f)
                     .collect();
                 for f in inside {
                     self.unbind(ix, f);
@@ -500,26 +534,45 @@ impl VolumeIndex {
     }
 
     pub fn id(&self, frn: u64) -> Option<EntryId> {
-        self.map.get(&frn).copied()
+        if let Some(&id) = self.map.get(&record(frn))
+            && self.frn_of[id.0 as usize] == frn
+        {
+            return Some(id);
+        }
+        self.other.get(&frn).copied()
+    }
+
+    /// `(frn, id)` of every mapped entry, in no order.
+    fn pairs(&self) -> impl Iterator<Item = (u64, EntryId)> + '_ {
+        self.map
+            .values()
+            .map(|&id| (self.frn_of[id.0 as usize], id))
+            .chain(self.other.iter().map(|(&f, &id)| (f, id)))
+    }
+
+    /// Test aid: heap bytes of the FRN map (hashbrown: power-of-two
+    /// buckets at most 7/8 full, one control byte each).
+    #[doc(hidden)]
+    pub fn map_bytes(&self) -> usize {
+        table_bytes(&self.map) + table_bytes(&self.other)
     }
 
     /// Mapped entries, the root included.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.len() + self.other.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
     }
 
     /// `(frn, parent frn, id)` of every live entry of this volume except
     /// the root, parents before children.
     pub fn entries<'a>(&'a self, ix: &'a Index) -> impl Iterator<Item = (u64, u64, EntryId)> + 'a {
         let mut all: Vec<(usize, EntryId, u64)> = self
-            .map
-            .iter()
-            .filter(|&(&f, _)| f != self.root_frn)
-            .map(|(&f, &id)| (ix.ancestors(id).count(), id, f))
+            .pairs()
+            .filter(|&(f, _)| f != self.root_frn)
+            .map(|(f, id)| (ix.ancestors(id).count(), id, f))
             .collect();
         all.sort_unstable_by_key(|&(depth, id, _)| (depth, id.0));
         all.into_iter().map(move |(_, id, f)| {
@@ -529,6 +582,14 @@ impl VolumeIndex {
                 .map_or(self.root_frn, |p| self.frn(p).unwrap_or(ORPHAN_FRN));
             (f, parent, id)
         })
+    }
+}
+
+fn table_bytes<K, V, S>(m: &HashMap<K, V, S>) -> usize {
+    if m.capacity() == 0 {
+        0
+    } else {
+        (m.capacity() * 8 / 7).next_power_of_two() * (std::mem::size_of::<(K, V)>() + 1)
     }
 }
 
@@ -635,6 +696,79 @@ mod tests {
         assert!(v.id(50_000).is_some());
         let cap = v.frn_of.capacity();
         assert!(cap > n && cap <= n + (n / 8).max(1024), "{n} -> {cap}");
+    }
+
+    /// One entry bound to two FRNs is a damaged image: refused.
+    #[test]
+    fn parts_binding_an_entry_twice_are_refused() {
+        let mut ix = Index::new();
+        let v = VolumeIndex::build(
+            &mut ix,
+            "C:",
+            ROOT,
+            vec![d(ROOT, ROOT, ""), f(100, ROOT, "a.txt")],
+        );
+        let mut p = v.parts();
+        let id = v.id(100).unwrap().0;
+        p.frns.push((id, 200));
+        assert!(VolumeIndex::from_parts(&ix, p).is_none());
+    }
+
+    /// The map holds an FRN's record number (4 bytes) and the entry id
+    /// (4 bytes): at most 16 bytes an entry with its control byte and the
+    /// table's free room (24 with 8-byte FRN keys).
+    #[test]
+    fn the_frn_map_takes_at_most_sixteen_bytes_an_entry() {
+        let mut ix = Index::new();
+        let mut recs = vec![d(ROOT, ROOT, "")];
+        recs.extend((0..20_000u64).map(|i| f(100 + i, ROOT, &format!("f{i}.txt"))));
+        let v = VolumeIndex::build(&mut ix, "C:", ROOT, recs);
+        let per = v.map_bytes() as f64 / v.len() as f64;
+        assert!(per <= 16.0, "{per:.1} bytes an entry");
+    }
+
+    /// One MFT record reused by a new file before the old one's delete
+    /// arrived: both FRNs (same record number, other sequence number)
+    /// stay apart, and each goes on its own delete.
+    #[test]
+    fn frns_sharing_a_record_number_stay_apart() {
+        let seq = |s: u64, r: u64| (s << 48) | r;
+        let mut ix = Index::new();
+        let mut v = VolumeIndex::build(
+            &mut ix,
+            "C:",
+            ROOT,
+            vec![d(ROOT, ROOT, ""), f(seq(1, 100), ROOT, "eski.txt")],
+        );
+        let create = USN_REASON_FILE_CREATE;
+        v.apply(&mut ix, &rec(seq(2, 100), ROOT, "yeni.txt", false, create));
+        let (a, b) = (v.id(seq(1, 100)).unwrap(), v.id(seq(2, 100)).unwrap());
+        assert_ne!(a, b);
+        assert_eq!((ix.name(a), ix.name(b)), ("eski.txt", "yeni.txt"));
+        assert!(v.id(seq(3, 100)).is_none());
+        assert_eq!(v.len(), 3);
+        // a record number past u32 is told apart from its low 32 bits
+        let far = seq(1, 1 << 40);
+        v.apply(&mut ix, &rec(far, ROOT, "uzak.txt", false, create));
+        assert_eq!(v.id(far).map(|x| ix.name(x)), Some("uzak.txt"));
+        assert!(v.id(seq(1, 0)).is_none());
+        // and an image keeps them all
+        let w = VolumeIndex::from_parts(&ix, v.parts()).unwrap();
+        for frn in [seq(1, 100), seq(2, 100), far] {
+            assert_eq!(w.id(frn), v.id(frn));
+        }
+        let del = |frn| rec(frn, ROOT, "", false, USN_REASON_FILE_DELETE);
+        v.apply(&mut ix, &del(seq(2, 100)));
+        assert!(v.id(seq(2, 100)).is_none());
+        assert_eq!(v.id(seq(1, 100)), Some(a));
+        assert!(ix.is_live(a) && !ix.is_live(b));
+        v.apply(&mut ix, &del(seq(1, 100)));
+        v.apply(&mut ix, &del(far));
+        assert!(v.id(seq(1, 100)).is_none() && v.id(far).is_none());
+        assert_eq!(v.len(), 1);
+        let mut paths: Vec<(u64, u64)> = v.entries(&ix).map(|(f, p, _)| (f, p)).collect();
+        paths.sort();
+        assert!(paths.is_empty(), "{paths:?}");
     }
 
     #[test]

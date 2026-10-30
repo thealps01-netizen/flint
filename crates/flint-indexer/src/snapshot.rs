@@ -69,7 +69,9 @@ impl std::error::Error for SnapshotError {}
 /// Magic of an index image file (the service's warm start).
 pub const IMAGE_MAGIC: &[u8; 8] = b"FLNTIMG\0";
 /// 2: each volume also keeps what it leaves out (`crate::cut`).
-pub const IMAGE_VERSION: u32 = 2;
+/// 3: one name text, a name equal to its folded form stored once (2 is
+/// still read: see [`flint_core::Index::from_image_v2`]).
+pub const IMAGE_VERSION: u32 = 3;
 
 /// A volume's journal position and FRN map in an image.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,8 +102,23 @@ fn sum64(b: &[u8]) -> u64 {
 /// The whole index plus each volume's journal position: restoring it is
 /// a copy, not a rebuild (warm start ≤ 2 s on millions of entries).
 pub fn encode_image(ix: &Index, vols: &[VolumeImage]) -> Vec<u8> {
+    encode_image_as(ix, vols, IMAGE_VERSION)
+}
+
+/// [`encode_image`] in an image `version`: 2 writes the index as Flint
+/// 0.1.3 did (to test the upgrade).
+#[doc(hidden)]
+pub fn encode_image_as(ix: &Index, vols: &[VolumeImage], version: u32) -> Vec<u8> {
+    assert!(
+        version == 2 || version == IMAGE_VERSION,
+        "image version {version}"
+    );
     let mut p = Vec::with_capacity(ix.heap_bytes() + 64);
-    ix.to_image(&mut p);
+    if version == 2 {
+        ix.to_image_v2(&mut p);
+    } else {
+        ix.to_image(&mut p);
+    }
     p.extend_from_slice(&(vols.len() as u32).to_le_bytes());
     for v in vols {
         put_str(&mut p, &v.drive);
@@ -136,7 +153,7 @@ pub fn encode_image(ix: &Index, vols: &[VolumeImage]) -> Vec<u8> {
     }
     let mut out = Vec::with_capacity(p.len() + 28);
     out.extend_from_slice(IMAGE_MAGIC);
-    out.extend_from_slice(&IMAGE_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&(p.len() as u64).to_le_bytes());
     out.extend_from_slice(&sum64(&p).to_le_bytes());
     out.extend_from_slice(&p);
@@ -152,16 +169,18 @@ pub fn decode_image(bytes: &[u8]) -> Result<(Index, Vec<VolumeImage>), SnapshotE
         return Err(SnapshotError::BadMagic);
     }
     let version = h.u32()?;
-    if version != IMAGE_VERSION {
-        return Err(SnapshotError::Version(version));
-    }
+    let read = match version {
+        IMAGE_VERSION => Index::from_image,
+        2 => Index::from_image_v2,
+        _ => return Err(SnapshotError::Version(version)),
+    };
     let len = h.u64()?;
     let sum = h.u64()?;
     let payload = h.take(usize::try_from(len).map_err(|_| SnapshotError::Truncated)?)?;
     if h.at != bytes.len() || sum64(payload) != sum {
         return Err(SnapshotError::Checksum);
     }
-    let (ix, used) = Index::from_image(payload).map_err(|e| match e {
+    let (ix, used) = read(payload).map_err(|e| match e {
         flint_core::ImageError::Truncated => SnapshotError::Truncated,
         flint_core::ImageError::Invalid(_) => SnapshotError::Checksum,
     })?;
@@ -763,6 +782,32 @@ mod tests {
         twice.frns.push((id + 1, frn)); // one FRN on two entries
         assert!(VolumeIndex::from_parts(&b, img.parts.clone()).is_some());
         assert!(VolumeIndex::from_parts(&b, twice).is_none());
+    }
+
+    /// The image Flint 0.1.3 saved (version 2) still loads after an
+    /// update: a warm start, not a scan from scratch.
+    #[test]
+    fn an_image_from_0_1_3_still_loads() {
+        let mut a = Index::new();
+        let mut va = VolumeIndex::build(&mut a, "C:", ROOT, volume(300));
+        va.apply(&mut a, &rec(5000, 100, "Yeni Dosya.txt", false, 1));
+        let img = VolumeImage {
+            drive: "C:".into(),
+            volume_serial: 7,
+            journal_id: 8,
+            next_usn: 9,
+            parts: va.parts(),
+        };
+        let old = encode_image_as(&a, std::slice::from_ref(&img), 2);
+        let (b, vols) = decode_image(&old).unwrap();
+        assert_eq!(vols, vec![img]);
+        assert_eq!(sorted_paths(&a), sorted_paths(&b));
+        let vb = VolumeIndex::from_parts(&b, vols[0].parts.clone()).unwrap();
+        assert_eq!(vb.id(5000).map(|id| b.folded(id)), Some("yeni dosya.txt"));
+        // and is saved again in the current layout
+        let new = encode_image(&b, &vols);
+        assert_eq!(new[8..12], IMAGE_VERSION.to_le_bytes());
+        assert!(new.len() < old.len());
     }
 
     /// A walked tree (no FRNs) is saved with entry ids as FRNs and comes
