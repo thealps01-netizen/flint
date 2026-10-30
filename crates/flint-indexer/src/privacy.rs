@@ -247,9 +247,10 @@ pub mod os {
         GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorLength,
+        GetSecurityDescriptorOwner, IsValidSecurityDescriptor, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        SID_AND_ATTRIBUTES,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
@@ -499,6 +500,64 @@ pub mod os {
             Ok(Folder { listable, owner })
         }
 
+        /// Checks a self-relative descriptor as stored in `$SDS` (no
+        /// folder is opened); malformed bytes are an error.
+        pub fn check_descriptor(&mut self, sd: &[u8]) -> io::Result<Folder> {
+            let bad =
+                || io::Error::new(io::ErrorKind::InvalidData, "malformed security descriptor");
+            if !crate::ntfs::descriptor_in_bounds(sd) {
+                return Err(bad());
+            }
+            // the OS reads descriptors as aligned structures
+            let mut buf = vec![0u64; sd.len().div_ceil(8)];
+            // SAFETY: buf holds at least sd.len() bytes; the regions differ.
+            unsafe {
+                std::ptr::copy_nonoverlapping(sd.as_ptr(), buf.as_mut_ptr().cast::<u8>(), sd.len())
+            };
+            // owner and DACL only, as GetSecurityInfo gives them for a
+            // folder: no group, no SACL (labels, audit)
+            {
+                // SAFETY: buf holds at least the 20-byte header (checked by
+                // descriptor_in_bounds); u8 has no alignment needs.
+                let head =
+                    unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), 20) };
+                head[2] &= !0x10; // SE_SACL_PRESENT
+                head[8..16].fill(0); // group and SACL offsets
+            }
+            let p: PSECURITY_DESCRIPTOR = buf.as_mut_ptr().cast();
+            // SAFETY: p points to sd.len() bytes whose parts all lie inside
+            // them (descriptor_in_bounds); buf outlives every use of p.
+            if unsafe { IsValidSecurityDescriptor(p) } == 0
+                || unsafe { GetSecurityDescriptorLength(p) } as usize > sd.len()
+            {
+                return Err(bad());
+            }
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut defaulted = 0;
+            // SAFETY: p is a valid descriptor; owner points into it.
+            if unsafe { GetSecurityDescriptorOwner(p, &mut owner, &mut defaulted) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if owner.is_null() {
+                return Err(bad());
+            }
+            let owner = sid_string(owner)?;
+            let (mut present, mut dacl) = (0, std::ptr::null_mut::<ACL>());
+            // SAFETY: as above; dacl points into p's bytes.
+            if unsafe { GetSecurityDescriptorDacl(p, &mut present, &mut dacl, &mut defaulted) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // no DACL: everyone may list (as GetSecurityInfo reports it)
+            let dacl = if present == 0 {
+                std::ptr::null_mut()
+            } else {
+                dacl
+            };
+            let listable = self.check_sd(p, dacl)?;
+            Ok(Folder { listable, owner })
+        }
+
         /// Checks the folder at `p` (opened for its descriptor only).
         pub fn check_path(&mut self, p: &Path) -> io::Result<Folder> {
             let h = open_meta(p, false)?;
@@ -554,6 +613,48 @@ pub mod os {
             let ok = err == 0 && granted & FILE_LIST_DIRECTORY != 0;
             self.cache.insert(key, ok);
             Ok(ok)
+        }
+    }
+
+    /// A folder's owner and DACL as a self-relative descriptor (tests).
+    #[cfg(test)]
+    pub fn descriptor_bytes(p: &Path) -> io::Result<Vec<u8>> {
+        use windows_sys::Win32::Security::GetSecurityDescriptorLength;
+        let h = open_meta(p, false)?;
+        let mut raw: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: h has READ_CONTROL; raw is LocalAlloc'd, freed by Sddl.
+        let r = unsafe {
+            GetSecurityInfo(
+                h.raw(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut raw,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::from_raw_os_error(r as i32));
+        }
+        let raw = Sddl(raw);
+        // SAFETY: raw.0 is a valid self-relative descriptor of this length.
+        let n = unsafe { GetSecurityDescriptorLength(raw.0) } as usize;
+        // SAFETY: as above.
+        Ok(unsafe { std::slice::from_raw_parts(raw.0 as *const u8, n) }.to_vec())
+    }
+
+    /// Clears the inherited mark of every ACE in a self-relative
+    /// descriptor's DACL, as NTFS stores some (tests).
+    #[cfg(test)]
+    pub fn clear_inherited_marks(sd: &mut [u8]) {
+        let dacl = u32::from_le_bytes(sd[16..20].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes([sd[dacl + 4], sd[dacl + 5]]);
+        let mut o = dacl + 8;
+        for _ in 0..count {
+            sd[o + 1] &= !0x10; // INHERITED_ACE
+            o += u16::from_le_bytes([sd[o + 2], sd[o + 3]]) as usize;
         }
     }
 
@@ -1074,6 +1175,68 @@ mod tests {
         )
         .unwrap();
         assert!(!c.check_path(&deny).unwrap().listable);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A folder's descriptor read from `$SDS` decides as the folder
+    /// itself does: same owner, same listable verdict, also with the
+    /// inherited mark NTFS leaves off stored ACEs; malformed bytes fail.
+    #[cfg(windows)]
+    #[test]
+    fn a_stored_descriptor_decides_like_its_folder() {
+        let me = crate::pipe::current_user_sid().unwrap();
+        let base = std::env::temp_dir().join(format!("flint-sds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let cases = [
+            ("yalniz-ben", format!("O:{me}D:P(A;OICI;FA;;;{me})")),
+            (
+                "herkes",
+                format!("O:{me}D:P(A;OICI;FA;;;{me})(A;OICI;0x1200a9;;;BU)"),
+            ),
+            (
+                "yasak",
+                format!("O:{me}D:P(D;OICI;0x1;;;BU)(A;OICI;FA;;;WD)"),
+            ),
+            (
+                "miras",
+                format!("O:{me}D:(A;OICIID;0x1200a9;;;BU)(A;OICI;FA;;;{me})"),
+            ),
+        ];
+        let mut c = os::AccessChecker::new().unwrap();
+        for (name, sddl) in &cases {
+            let dir = base.join(name);
+            os::secure_dir(&dir, sddl, &[&me]).unwrap();
+            let live = c.check_path(&dir).unwrap();
+            let mut sd = os::descriptor_bytes(&dir).unwrap();
+            assert_eq!(c.check_descriptor(&sd).unwrap(), live, "{name}");
+            os::clear_inherited_marks(&mut sd);
+            assert_eq!(
+                c.check_descriptor(&sd).unwrap(),
+                live,
+                "{name}, marks cleared"
+            );
+        }
+        let sd = os::descriptor_bytes(&base.join("herkes")).unwrap();
+        // a stored descriptor carries a SACL (here a high mandatory label
+        // denying reads from below): read as GetSecurityInfo reads the
+        // folder's owner and DACL only, it does not change the verdict
+        let mut labelled = sd.clone();
+        let sacl_at = labelled.len() as u32;
+        labelled[2] |= 0x10; // SE_SACL_PRESENT
+        labelled[12..16].copy_from_slice(&sacl_at.to_le_bytes());
+        labelled.extend([2, 0, 28, 0, 1, 0, 0, 0]); // ACL: 28 bytes, 1 ACE
+        labelled.extend([0x11, 0, 20, 0, 0x02, 0, 0, 0]); // label ACE, NO_READ_UP
+        labelled.extend([1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x30, 0, 0]); // S-1-16-12288
+        let live = c.check_path(&base.join("herkes")).unwrap();
+        assert!(live.listable);
+        assert_eq!(c.check_descriptor(&labelled).unwrap(), live, "with a SACL");
+        assert!(
+            c.check_descriptor(&sd[..sd.len() - 4]).is_err(),
+            "cut short"
+        );
+        assert!(c.check_descriptor(&[0u8; 8]).is_err());
+        assert!(c.check_descriptor(&[]).is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 

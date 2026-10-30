@@ -3,6 +3,29 @@
 All notable changes to Flint are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.5 — 2026-10-31
+
+- Full indexing no longer leaves memory behind in Windows. To decide
+  which folders an ordinary user may list, a first index opened each
+  folder it checked for its permissions (432 k of them on the measured
+  C:), and on the measured PC (Windows 11 build 26300) a file system
+  filter of Windows itself (wcifs.sys, the Windows Container Isolation
+  filter) kept a little kernel memory for each folder opened that way
+  whose cached state Windows had dropped, until the PC restarts. Each
+  first index of C: left about 200 k such allocations, over 1 GB, so a
+  few reinstalls or rescans filled the memory. The service now reads
+  each folder's security id from the MFT and the permissions from the
+  volume's own table of them (`$Secure`), after asking Windows to write
+  pending changes to disk, so a permission changed a moment before is
+  seen. In the normal case no folder is opened: on C: (0.97 M folders,
+  2.2 k distinct security ids) reading the ids, the permissions and
+  checking them took 2.1–2.3 s, the kernel allocation count did not
+  change, and on a sample of 965 folders the verdicts equal those from
+  opening each. A folder whose permissions cannot be read that way (a
+  record being written, an id without a readable entry) is still
+  opened. Folders that new changes bring are checked the same way.
+- Memory already held by that filter is given back only by a restart.
+
 ## 0.1.4 — 2026-10-30
 
 - The index takes about a quarter less memory, with nothing left out.
