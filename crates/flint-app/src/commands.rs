@@ -67,11 +67,11 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// How "Enable full indexing" ended.
+/// How "Enable full indexing" or "Turn off full indexing" ended.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Enable {
-    /// The service is installed and started.
+    /// The service is installed and started (or stopped and removed).
     Done,
     /// The user said no to the administrator prompt (not an error).
     Declined,
@@ -101,23 +101,7 @@ pub fn enable_full_indexing(
     program_files: Option<&std::path::Path>,
     run_elevated: impl FnOnce(&std::path::Path, &str) -> std::io::Result<u32>,
 ) -> Result<Enable, String> {
-    let dir = app_exe.parent().unwrap_or(std::path::Path::new("."));
-    if let Some(pf) = program_files
-        && !admin_only(dir, pf)
-    {
-        return Err(format!(
-            "Full indexing can be turned on only for Flint installed in {} (this copy runs from {}). Install Flint with its installer.",
-            pf.display(),
-            dir.display()
-        ));
-    }
-    let indexer = dir.join("flint-indexer.exe");
-    if !indexer.is_file() {
-        return Err(format!(
-            "flint-indexer.exe was not found in {}. Reinstall Flint to enable full indexing.",
-            dir.display()
-        ));
-    }
+    let indexer = admin_indexer(app_exe, program_files, "turned on")?;
     match run_elevated(&indexer, "install-service") {
         Ok(0) => Ok(Enable::Done),
         Ok(code) => Err(format!(
@@ -126,6 +110,54 @@ pub fn enable_full_indexing(
         Err(e) if e.raw_os_error() == Some(ERROR_CANCELLED) => Ok(Enable::Declined),
         Err(e) => Err(format!("The service could not be installed: {e}")),
     }
+}
+
+/// Stops and removes the FlintIndexer service and its saved index
+/// (every account's file names) through one administrator prompt, the
+/// same way [`enable_full_indexing`] installs it: Flint goes back to
+/// Basic mode.
+pub fn disable_full_indexing(
+    app_exe: &std::path::Path,
+    program_files: Option<&std::path::Path>,
+    run_elevated: impl FnOnce(&std::path::Path, &str) -> std::io::Result<u32>,
+) -> Result<Enable, String> {
+    let indexer = admin_indexer(app_exe, program_files, "turned off")?;
+    match run_elevated(&indexer, "uninstall-service") {
+        Ok(0) => Ok(Enable::Done),
+        Ok(code) => Err(format!(
+            "The service could not be removed (exit code {code}). Details: %LOCALAPPDATA%\\Flint\\logs"
+        )),
+        Err(e) if e.raw_os_error() == Some(ERROR_CANCELLED) => Ok(Enable::Declined),
+        Err(e) => Err(format!("The service could not be removed: {e}")),
+    }
+}
+
+/// `flint-indexer.exe` beside the app, when it may be run as
+/// administrator (see [`enable_full_indexing`]); `what` ends the message
+/// of a copy outside Program Files.
+fn admin_indexer(
+    app_exe: &std::path::Path,
+    program_files: Option<&std::path::Path>,
+    what: &str,
+) -> Result<std::path::PathBuf, String> {
+    let dir = app_exe.parent().unwrap_or(std::path::Path::new("."));
+    if let Some(pf) = program_files
+        && !admin_only(dir, pf)
+    {
+        return Err(format!(
+            "Full indexing can be {what} only for Flint installed in {} (this copy runs from {}). Install Flint with its installer.",
+            pf.display(),
+            dir.display()
+        ));
+    }
+    let indexer = dir.join("flint-indexer.exe");
+    if !indexer.is_file() {
+        return Err(format!(
+            "flint-indexer.exe was not found in {}. Reinstall Flint to change full indexing.",
+            dir.display()
+        ));
+    }
+    Ok(indexer)
 }
 
 #[cfg(test)]
@@ -202,6 +234,53 @@ mod tests {
         })
         .unwrap_err();
         assert!(!other.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disable_full_indexing_removes_the_service_the_same_way() {
+        let pf = std::path::Path::new(r"C:\Program Files");
+        let mut ran = false;
+        let r = disable_full_indexing(
+            std::path::Path::new(r"D:\Apps\Flint\flint.exe"),
+            Some(pf),
+            |_, _| {
+                ran = true;
+                Ok(0)
+            },
+        );
+        assert!(
+            r.unwrap_err().contains("turned off only"),
+            "nothing runs outside Program Files"
+        );
+        assert!(!ran);
+        let dir = std::env::temp_dir().join(format!("flint-disable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("flint.exe");
+        std::fs::write(dir.join("flint-indexer.exe"), b"").unwrap();
+        let mut seen = None;
+        let r = disable_full_indexing(&exe, Some(&std::env::temp_dir()), |p, args| {
+            seen = Some((p.to_path_buf(), args.to_string()));
+            Ok(0)
+        });
+        assert_eq!(r, Ok(Enable::Done));
+        assert_eq!(
+            seen,
+            Some((
+                dir.join("flint-indexer.exe"),
+                "uninstall-service".to_string()
+            ))
+        );
+        let declined = disable_full_indexing(&exe, Some(&std::env::temp_dir()), |_, _| {
+            Err(std::io::Error::from_raw_os_error(ERROR_CANCELLED))
+        });
+        assert_eq!(declined, Ok(Enable::Declined));
+        let failed =
+            disable_full_indexing(&exe, Some(&std::env::temp_dir()), |_, _| Ok(4)).unwrap_err();
+        assert!(
+            failed.contains("could not be removed") && failed.contains("exit code 4"),
+            "{failed}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

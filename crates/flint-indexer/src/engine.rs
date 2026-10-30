@@ -9,6 +9,7 @@
 //! before anything is served.
 
 use crate::access::{self, Verdict};
+use crate::cut::{self, Cut};
 use crate::pipe::{ServerHandle, current_user_sid, serve_index, service_sddl, user_sddl};
 use crate::privacy::{self, OwnerRegistry};
 use crate::protocol::{PIPE_NAME, ServerMsg, VolumeStatus};
@@ -55,6 +56,9 @@ pub struct Config {
     pub pipe_name: String,
     pub sddl: String,
     pub save_every: Duration,
+    /// The service also indexes every profile's app data folders (by
+    /// default it leaves out their contents but for the Start menu).
+    pub app_data: bool,
 }
 
 impl Config {
@@ -71,6 +75,7 @@ impl Config {
             data_dir,
             pipe_name,
             save_every: SAVE_EVERY,
+            app_data: false,
         })
     }
 
@@ -91,7 +96,15 @@ impl Config {
             pipe_name: PIPE_NAME.to_string(),
             sddl: service_sddl(),
             save_every: SAVE_EVERY,
+            app_data: false,
         }
+    }
+
+    /// A service config that indexes the app data folders too (no effect
+    /// in user mode, where `skipping` decides).
+    pub fn including_app_data(mut self, on: bool) -> Config {
+        self.app_data = on;
+        self
     }
 
     fn snapshot_path(&self) -> PathBuf {
@@ -539,6 +552,9 @@ struct VolState {
     vi: Option<VolumeIndex>,
     /// Caught up with the journal and following it.
     live: bool,
+    /// What `vi` holds is not known (it went stale) until a scan again
+    /// succeeds: left out of saves, so a restart scans it.
+    rescan: bool,
 }
 
 fn start_service(cfg: Config) -> io::Result<Engine> {
@@ -610,6 +626,7 @@ fn start_service(cfg: Config) -> io::Result<Engine> {
             next_usn: 0,
             vi: None,
             live: false,
+            rescan: false,
         };
         if let Some(at) = saved
             .iter()
@@ -619,6 +636,15 @@ fn start_service(cfg: Config) -> io::Result<Engine> {
             let root = s.parts.root;
             match volume::replay_from(s.journal_id, s.next_usn, &journal) {
                 Replay::From(usn) => match VolumeIndex::from_parts(&ix, s.parts) {
+                    Some(vi)
+                        if vi.cut().rules()
+                            != skip_rules(machine.as_ref(), cfg.app_data, &drive) =>
+                    {
+                        log::line(format!(
+                            "{drive}: saved with other app data rules; scanning again"
+                        ));
+                        drop_tree(&mut ix, root);
+                    }
                     Some(vi) => {
                         st.vi = Some(vi);
                         st.next_usn = usn;
@@ -685,6 +711,7 @@ fn start_service(cfg: Config) -> io::Result<Engine> {
             pending: pending.clone(),
             dirty: dirty.clone(),
             machine: machine.clone(),
+            app_data: cfg.app_data,
             state: slot.clone(),
             all: states.clone(),
         };
@@ -751,8 +778,19 @@ struct VolCtx {
     pending: Arc<AtomicUsize>,
     dirty: Arc<AtomicBool>,
     machine: Option<privacy::Machine>,
+    /// Index the app data folders too (`Config::app_data`).
+    app_data: bool,
     state: Arc<Mutex<VolState>>,
     all: Vec<Arc<Mutex<VolState>>>,
+}
+
+/// The folders `drive` leaves out: every profile's app data folders,
+/// unless they are indexed too (none without the profile list).
+fn skip_rules(machine: Option<&privacy::Machine>, app_data: bool, drive: &str) -> Vec<cut::Rule> {
+    match machine {
+        Some(m) if !app_data => cut::app_data_rules(m, drive),
+        _ => Vec::new(),
+    }
 }
 
 fn publish_status(shared: &Shared, vols: &[&VolState]) {
@@ -888,6 +926,10 @@ fn scan_volume(v: &Volume, ctx: &VolCtx, journal: JournalInfo) -> bool {
         return false;
     }
     let read = t.elapsed();
+    let mut cut = Cut::new(skip_rules(ctx.machine.as_ref(), ctx.app_data, &drive));
+    let found = records.len();
+    cut.filter(root, &mut records);
+    let left_out = found - records.len();
     // folders with the same security id share one descriptor: one check
     // per id (budget +20 % of the first index)
     let sids: std::collections::HashMap<u64, u32> = records
@@ -912,7 +954,8 @@ fn scan_volume(v: &Volume, ctx: &VolCtx, journal: JournalInfo) -> bool {
     }
     let checked = t.elapsed();
     log::line(format!(
-        "{drive}: {} entries; MFT read {:.2} s, build {:.2} s, access checks {:.2} s \
+        "{drive}: {} entries ({left_out} in app data folders left out); MFT read {:.2} s, \
+         build {:.2} s, access checks {:.2} s \
          ({} folders checked, {} opened, {} with a security id, {} restricted, {} failed)",
         ix.live_len(),
         read.as_secs_f64(),
@@ -933,7 +976,15 @@ fn scan_volume(v: &Volume, ctx: &VolCtx, journal: JournalInfo) -> bool {
     let (Ok(mut s), Ok(mut g)) = (ctx.state.lock(), ctx.shared.index.write()) else {
         return false;
     };
-    s.vi = Some(snapshot::restore_owned(&mut g, snap));
+    // a scan again over a stale volume replaces it here, so its entries
+    // were served meanwhile
+    if let Some(old) = s.vi.take() {
+        drop_volume(&mut g, &old);
+    }
+    let mut vi = snapshot::restore_owned(&mut g, snap);
+    vi.set_cut(cut);
+    s.vi = Some(vi);
+    s.rescan = false;
     s.journal = journal;
     s.next_usn = journal.next_usn;
     true
@@ -1000,10 +1051,19 @@ fn count_live(ctx: &VolCtx) {
 
 fn follow_volume(v: &Volume, ctx: &VolCtx, counted: &mut bool) {
     let mut checker = privacy::os::AccessChecker::new().ok();
+    // after a failed scan again: when to try the next one, and the delay
+    // after that
+    let mut retry_at: Option<Instant> = None;
+    let mut delay = RESCAN_RETRY;
     'volume: loop {
-        // scan when there is no usable snapshot for this volume
-        let needs_scan = ctx.state.lock().map(|s| s.vi.is_none()).unwrap_or(true);
-        if needs_scan {
+        // scan when there is no usable snapshot for this volume, or it
+        // went stale (see `VolumeIndex::take_stale`) and no retry waits
+        let (missing, pending) = ctx
+            .state
+            .lock()
+            .map(|s| (s.vi.is_none(), s.rescan))
+            .unwrap_or((true, false));
+        if missing || (pending && retry_at.is_none_or(|t| Instant::now() >= t)) {
             let (journal, _) = match v.query_journal() {
                 Ok(j) => j,
                 Err(e) => {
@@ -1011,10 +1071,25 @@ fn follow_volume(v: &Volume, ctx: &VolCtx, counted: &mut bool) {
                     break;
                 }
             };
-            if !scan_volume(v, ctx, journal) {
-                break;
+            if scan_volume(v, ctx, journal) {
+                retry_at = None;
+                delay = RESCAN_RETRY;
+                ctx.dirty.store(true, Ordering::SeqCst);
+            } else {
+                let kept = ctx.state.lock().is_ok_and(|s| s.vi.is_some());
+                if !kept || ctx.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // a scan again failed: the index it has is served and its
+                // journal followed (not saved) until the next try
+                log::line(format!(
+                    "{}: scanning again failed; retrying in {} s",
+                    v.drive,
+                    delay.as_secs()
+                ));
+                retry_at = Some(Instant::now() + delay);
+                delay = (delay * 2).min(RESCAN_RETRY_MAX);
             }
-            ctx.dirty.store(true, Ordering::SeqCst);
         }
         refresh_status(ctx);
         let mut live_sent = false;
@@ -1067,7 +1142,10 @@ fn follow_volume(v: &Volume, ctx: &VolCtx, counted: &mut bool) {
                     }
                 }
             }
-            if !recs.is_empty() && !apply_batch(v, ctx, checker.as_mut(), &recs) {
+            if !recs.is_empty()
+                && !(apply_batch(v, ctx, checker.as_mut(), &recs)
+                    && read_surfaced(v, ctx, checker.as_mut()))
+            {
                 // a poisoned lock: stop following rather than skip records
                 // (the served index is then refused or stale, never wrong)
                 log::line(format!(
@@ -1076,11 +1154,28 @@ fn follow_volume(v: &Volume, ctx: &VolCtx, counted: &mut bool) {
                 ));
                 return;
             }
+            let mut went_stale = false;
             if let Ok(mut s) = ctx.state.lock() {
+                // the position and the stale mark change together, so a
+                // save never has one without the other
                 s.next_usn = next;
+                if s.vi.as_mut().is_some_and(|vi| vi.take_stale()) {
+                    went_stale = !s.rescan;
+                    s.rescan = true;
+                }
             }
             if !recs.is_empty() {
                 ctx.dirty.store(true, Ordering::SeqCst);
+            }
+            if went_stale && retry_at.is_none() {
+                log::line(format!(
+                    "{}: an app data folder moved or appeared over indexed files; scanning again",
+                    v.drive
+                ));
+                continue 'volume;
+            }
+            if retry_at.is_some_and(|t| Instant::now() >= t) {
+                continue 'volume;
             }
             if !live_sent && (recs.is_empty() || next == from) {
                 live_sent = true;
@@ -1093,6 +1188,103 @@ fn follow_volume(v: &Volume, ctx: &VolCtx, counted: &mut bool) {
                 }
                 refresh_status(ctx);
             }
+        }
+    }
+}
+
+/// The most entries read from folders moved out of app data folders
+/// before a scan of the volume is cheaper.
+const SURFACED_MAX: usize = 200_000;
+
+/// The first wait before a failed scan again is tried again; it doubles
+/// up to [`RESCAN_RETRY_MAX`].
+const RESCAN_RETRY: Duration = Duration::from_secs(60);
+const RESCAN_RETRY_MAX: Duration = Duration::from_secs(3600);
+
+/// A folder that could not be listed because it is gone (deleted, or
+/// being deleted): its removal comes through the journal.
+fn gone(e: &io::Error) -> bool {
+    // file / path not found, invalid id, delete pending
+    matches!(e.raw_os_error(), Some(2 | 3 | 87 | 303))
+}
+
+/// Reads what the folders moved out of app data folders hold (their
+/// contents were never followed) and applies it like journal records,
+/// with the same folder checks. More than [`SURFACED_MAX`] entries, or a
+/// folder that cannot be listed, leaves the volume stale (scanned again).
+/// False on a poisoned lock.
+fn read_surfaced(
+    v: &Volume,
+    ctx: &VolCtx,
+    mut checker: Option<&mut privacy::os::AccessChecker>,
+) -> bool {
+    use crate::usn::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
+    // the folders read already: applying a listing surfaces its subfolders
+    // again, which were listed with it
+    let mut listed: std::collections::HashSet<u64> = Default::default();
+    let mut total = 0usize;
+    loop {
+        let mut todo = match ctx.state.lock() {
+            Ok(mut s) => {
+                s.vi.as_mut()
+                    .map(|vi| vi.take_surfaced())
+                    .unwrap_or_default()
+            }
+            Err(_) => return false,
+        };
+        todo.retain(|f| !listed.contains(f));
+        if todo.is_empty() {
+            return true;
+        }
+        let mut recs = Vec::new();
+        let mut give_up = None;
+        while let Some(f) = todo.pop() {
+            if !listed.insert(f) {
+                continue;
+            }
+            match v.list_dir(f) {
+                // a listed folder comes before what it holds; links to
+                // folders are listed, not entered (the MFT has their
+                // targets at their own place)
+                Ok(list) => {
+                    todo.extend(
+                        list.iter()
+                            .filter(|r| {
+                                r.attrs & FILE_ATTRIBUTE_DIRECTORY != 0
+                                    && r.attrs & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                            })
+                            .map(|r| r.frn),
+                    );
+                    recs.extend(list);
+                }
+                Err(e) if gone(&e) => {}
+                Err(e) => give_up = Some(format!("a folder could not be listed ({e})")),
+            }
+            if total + recs.len() > SURFACED_MAX {
+                give_up = Some(format!("more than {SURFACED_MAX} entries"));
+            }
+            if give_up.is_some() {
+                break;
+            }
+        }
+        if let Some(why) = give_up {
+            log::line(format!(
+                "{}: reading a folder moved out of app data: {why}",
+                v.drive
+            ));
+            return match ctx.state.lock() {
+                Ok(mut s) => {
+                    if let Some(vi) = s.vi.as_mut() {
+                        vi.mark_stale();
+                    }
+                    true
+                }
+                Err(_) => false,
+            };
+        }
+        total += recs.len();
+        if !recs.is_empty() && !apply_batch(v, ctx, checker.as_deref_mut(), &recs) {
+            return false;
         }
     }
 }
@@ -1224,18 +1416,7 @@ fn save_service(
     }
     let bytes = match shared.index.read() {
         Ok(ix) => {
-            let vols: Vec<snapshot::VolumeImage> = guards
-                .iter()
-                .filter_map(|s| {
-                    Some(snapshot::VolumeImage {
-                        drive: s.drive.clone(),
-                        volume_serial: s.serial,
-                        journal_id: s.journal.id,
-                        next_usn: s.next_usn,
-                        parts: s.vi.as_ref()?.parts(),
-                    })
-                })
-                .collect();
+            let vols = image_volumes(guards.iter().map(|g| &**g));
             if vols.is_empty() {
                 return;
             }
@@ -1252,6 +1433,23 @@ fn save_service(
         )),
         Err(e) => log::line(format!("image not saved ({}): {e}", path.display())),
     }
+}
+
+/// The volumes a save keeps: those with an index, but for one waiting
+/// for a scan again (what it holds is not known; a restart scans it).
+fn image_volumes<'a>(states: impl Iterator<Item = &'a VolState>) -> Vec<snapshot::VolumeImage> {
+    states
+        .filter(|s| !s.rescan)
+        .filter_map(|s| {
+            Some(snapshot::VolumeImage {
+                drive: s.drive.clone(),
+                volume_serial: s.serial,
+                journal_id: s.journal.id,
+                next_usn: s.next_usn,
+                parts: s.vi.as_ref()?.parts(),
+            })
+        })
+        .collect()
 }
 
 /// Share of left-over name text above which a save compacts first.
@@ -1273,5 +1471,42 @@ mod tests {
         .map(PathBuf::from)
         .collect();
         assert_eq!(drives_of(&roots), vec!["C:", "D:"]);
+    }
+
+    #[test]
+    fn a_volume_waiting_for_a_scan_again_is_not_saved() {
+        let mut ix = Index::new();
+        let state = |drive: &str, rescan: bool, ix: &mut Index| VolState {
+            drive: drive.into(),
+            serial: 1,
+            journal: JournalInfo {
+                id: 9,
+                first_usn: 0,
+                next_usn: 100,
+            },
+            next_usn: 100,
+            vi: Some(VolumeIndex::build(ix, drive, 5, Vec::new())),
+            live: true,
+            rescan,
+        };
+        let c = state("C:", true, &mut ix);
+        let d = state("D:", false, &mut ix);
+        let mut e = state("E:", false, &mut ix);
+        e.vi = None;
+        let saved = image_volumes([&c, &d, &e].into_iter());
+        assert_eq!(
+            saved.iter().map(|v| v.drive.as_str()).collect::<Vec<_>>(),
+            ["D:"]
+        );
+    }
+
+    #[test]
+    fn a_folder_gone_before_its_listing_is_not_an_error() {
+        for code in [2, 3, 87, 303] {
+            assert!(gone(&io::Error::from_raw_os_error(code)), "{code}");
+        }
+        // access denied or anything else: the volume is scanned again
+        assert!(!gone(&io::Error::from_raw_os_error(5)));
+        assert!(!gone(&io::Error::other("x")));
     }
 }

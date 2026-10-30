@@ -187,7 +187,7 @@ fn key_within(k: &str, base: &str) -> bool {
 }
 
 /// `p` is `base` or lies below it, case-insensitively.
-pub(crate) fn is_within(p: &Path, base: &Path) -> bool {
+pub fn is_within(p: &Path, base: &Path) -> bool {
     key_within(&path_key(p), &path_key(base))
 }
 

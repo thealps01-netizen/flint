@@ -106,11 +106,29 @@ struct Fallback {
     stopping: Arc<Mutex<()>>,
 }
 
+/// What the app indexes beside the service: the folders the service
+/// leaves out (app data) that Settings asks for. Started while the
+/// service answers; stopped when it does not (the user-folder indexer
+/// then covers them) or is turned off.
+#[derive(Default)]
+struct Beside {
+    make: Option<Factory>,
+    running: Option<Arc<dyn Backend>>,
+    failed: bool,
+    /// Held while a stopped indexer saves, so a new one does not read its
+    /// files half-written.
+    stopping: Arc<Mutex<()>>,
+}
+
 pub struct Sources {
     service: Box<dyn Backend>,
     /// Always asked (fixed drives the service does not index).
     always: Vec<Box<dyn Backend>>,
     fallback: Mutex<Fallback>,
+    beside: Mutex<Beside>,
+    /// The service was turned off from Settings: Basic mode, whatever an
+    /// answer still on its way says.
+    removed: AtomicBool,
     seen_service: AtomicBool,
     /// Service answers in a row (see `RELEASE_FALLBACK_AFTER`).
     service_streak: std::sync::atomic::AtomicU32,
@@ -144,10 +162,78 @@ impl Sources {
                 failed: None,
                 stopping: Arc::default(),
             }),
+            beside: Mutex::default(),
+            removed: AtomicBool::new(false),
             seen_service: AtomicBool::new(false),
             service_streak: Default::default(),
             latest: AtomicU64::new(0),
             excluded: Default::default(),
+        }
+    }
+
+    /// Also asks the backend `make` starts while the service answers.
+    pub fn beside_service(self, make: Factory) -> Sources {
+        if let Ok(mut b) = self.beside.lock() {
+            b.make = Some(make);
+        }
+        self
+    }
+
+    fn beside(&self) -> Option<Arc<dyn Backend>> {
+        // turned off: an answer still on its way starts nothing
+        if self.removed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut b = self.beside.lock().ok()?;
+        if b.running.is_none()
+            && !b.failed
+            && let Some(make) = b.make.as_ref()
+        {
+            let stopping = b.stopping.clone();
+            let _saved = stopping.lock();
+            match make() {
+                Ok(x) => b.running = Some(Arc::from(x)),
+                Err(e) => {
+                    crate::log::line(format!("the app data indexer did not start: {e}"));
+                    b.failed = true;
+                }
+            }
+        }
+        b.running.clone()
+    }
+
+    /// Stops what is indexed beside the service (it saves on its own
+    /// thread); it starts again when the service answers.
+    fn stop_beside(&self) {
+        let Ok(mut b) = self.beside.lock() else {
+            return;
+        };
+        let Some(running) = b.running.take() else {
+            return;
+        };
+        let stopping = b.stopping.clone();
+        std::thread::spawn(move || {
+            let _saving = stopping.lock();
+            running.shutdown();
+        });
+    }
+
+    /// The service was removed on purpose ("Turn off full indexing"):
+    /// Flint is in Basic mode, not missing its service, and what it
+    /// indexed beside the service is stopped (the user-folder indexer
+    /// covers it now).
+    pub fn forget_service(&self) {
+        self.removed.store(true, Ordering::SeqCst);
+        self.seen_service.store(false, Ordering::Relaxed);
+        self.service_streak.store(0, Ordering::Relaxed);
+        self.stop_beside();
+    }
+
+    /// The service was turned on again from Settings.
+    pub fn expect_service(&self) {
+        self.removed.store(false, Ordering::SeqCst);
+        if let Ok(mut b) = self.beside.lock() {
+            b.failed = false;
         }
     }
 
@@ -177,7 +263,10 @@ impl Sources {
         match e {
             BackendError::Version(d) => SourceState::VersionMismatch { detail: d.clone() },
             BackendError::Starting(_) => SourceState::ServiceStarting,
-            BackendError::Lost(r) if self.seen_service.load(Ordering::Relaxed) => {
+            BackendError::Lost(r)
+                if self.seen_service.load(Ordering::Relaxed)
+                    && !self.removed.load(Ordering::SeqCst) =>
+            {
                 SourceState::ServiceLost { reason: r.clone() }
             }
             BackendError::Lost(_) => SourceState::UserMode,
@@ -225,10 +314,18 @@ impl Sources {
                     self.release_fallback();
                 }
                 take(r);
+                if let Some(b) = self.beside() {
+                    match b.query(text, ask, boosts) {
+                        Ok(r) => take(r),
+                        Err(e) => crate::log::line(format!("app data search failed: {e:?}")),
+                    }
+                }
                 SourceState::Service
             }
             Err(e) => {
                 self.service_streak.store(0, Ordering::Relaxed);
+                // the user-folder indexer covers app data folders itself
+                self.stop_beside();
                 if let Some(f) = self.fallback() {
                     match f.query(text, ask, boosts) {
                         Ok(r) => take(r),
@@ -284,6 +381,9 @@ impl Sources {
         for b in &self.always {
             b.shutdown();
         }
+        if let Some(b) = self.beside.lock().ok().and_then(|b| b.running.clone()) {
+            b.shutdown();
+        }
         let (running, stopping) = match self.fallback.lock() {
             Ok(f) => (f.running.clone(), Some(f.stopping.clone())),
             Err(_) => (None, None),
@@ -312,6 +412,10 @@ impl Sources {
             Ok(s) => {
                 add(Ok(s));
                 self.seen_service.store(true, Ordering::Relaxed);
+                // its entries count; its drive is the service's already
+                if let Some(b) = self.beside() {
+                    add(b.status().map(|(n, _)| (n, Vec::new())));
+                }
                 SourceState::Service
             }
             Err(e) => {
@@ -793,6 +897,120 @@ mod tests {
             [r"C:\Windows\a.txt"],
             "the fallback is not asked while the service answers"
         );
+    }
+
+    /// A backend that records its shutdown (and answers like a Fake).
+    struct Recording(Fake, Arc<AtomicBool>);
+    impl Backend for Recording {
+        fn query(&self, t: &str, l: u32, b: &[(String, f32)]) -> Result<Reply, BackendError> {
+            self.0.query(t, l, b)
+        }
+        fn status(&self) -> Result<(u64, Vec<VolumeStatus>), BackendError> {
+            // a basic-mode drive, as a folder walk reports it
+            self.0.status().map(|(n, _)| {
+                let drive = VolumeStatus {
+                    drive: "C:".into(),
+                    state: "basic".into(),
+                    entries: n,
+                };
+                (n, vec![drive])
+            })
+        }
+        fn shutdown(&self) {
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn app_data_beside_the_service_is_asked_while_it_answers() {
+        let service = Fake::new(Err(BackendError::Lost("not installed".into())));
+        let profile = Fake::new(Ok(vec![hit(r"C:\Users\x\a.txt", 50)]));
+        let beside = Fake::new(Ok(vec![hit(r"C:\Users\x\AppData\Roaming\a.txt", 40)]));
+        let (started, stopped) = (
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (b, n, st) = (beside.clone(), started.clone(), stopped.clone());
+        let s = sources(&service, vec![], &profile).beside_service(Box::new(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Recording(b.clone(), st.clone())) as Box<dyn Backend>)
+        }));
+        // Basic mode: the user-folder indexer covers app data itself
+        assert_eq!(
+            paths(&s.query(1, "a", 10, &[]).unwrap()),
+            [r"C:\Users\x\a.txt"]
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        service.set(Ok(vec![hit(r"C:\Windows\a.txt", 50)]));
+        for seq in 2..5 {
+            let a = s.query(seq, "a", 10, &[]).unwrap();
+            assert_eq!(
+                paths(&a),
+                [r"C:\Windows\a.txt", r"C:\Users\x\AppData\Roaming\a.txt"]
+            );
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 1, "started once");
+        let st = s.status();
+        assert_eq!(st.entries, 2);
+        assert!(
+            st.volumes.is_empty(),
+            "the service lists the drive; the beside one does not"
+        );
+        // the service lost: the user-folder indexer covers app data, the
+        // beside one stops; it starts again when the service is back
+        service.set(Err(BackendError::Lost("crashed".into())));
+        let a = s.query(10, "a", 10, &[]).unwrap();
+        assert_eq!(paths(&a), [r"C:\Users\x\a.txt"]);
+        let end = Instant::now() + Duration::from_secs(5);
+        while !stopped.load(Ordering::SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopped.swap(false, Ordering::SeqCst));
+        service.set(Ok(vec![hit(r"C:\Windows\a.txt", 50)]));
+        assert_eq!(s.query(11, "a", 10, &[]).unwrap().hits.len(), 2);
+        assert_eq!(started.load(Ordering::SeqCst), 2, "started again");
+        // turned off on purpose: Basic mode, and the beside indexer stops
+        service.set(Err(BackendError::Lost("removed".into())));
+        s.forget_service();
+        let a = s.query(20, "a", 10, &[]).unwrap();
+        assert_eq!(a.source, SourceState::UserMode);
+        assert_eq!(paths(&a), [r"C:\Users\x\a.txt"]);
+        let end = Instant::now() + Duration::from_secs(5);
+        while !stopped.load(Ordering::SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn turned_off_is_basic_mode_even_after_a_late_answer() {
+        let service = Fake::new(Ok(vec![hit(r"C:\Windows\a.txt", 50)]));
+        let profile = Fake::new(Ok(vec![hit(r"C:\Users\x\a.txt", 50)]));
+        let s = sources(&service, vec![], &profile);
+        assert_eq!(
+            s.query(1, "a", 10, &[]).unwrap().source,
+            SourceState::Service
+        );
+        s.forget_service();
+        // an answer that was already on its way
+        assert_eq!(
+            s.query(2, "a", 10, &[]).unwrap().source,
+            SourceState::Service
+        );
+        service.set(Err(BackendError::Lost("removed".into())));
+        assert_eq!(
+            s.query(3, "a", 10, &[]).unwrap().source,
+            SourceState::UserMode
+        );
+        // turned on again: a lost service is reported again
+        s.expect_service();
+        service.set(Ok(vec![hit(r"C:\Windows\a.txt", 50)]));
+        s.query(4, "a", 10, &[]).unwrap();
+        service.set(Err(BackendError::Lost("crashed".into())));
+        assert!(matches!(
+            s.query(5, "a", 10, &[]).unwrap().source,
+            SourceState::ServiceLost { .. }
+        ));
     }
 
     #[test]

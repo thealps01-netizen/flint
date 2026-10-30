@@ -110,6 +110,10 @@ pub fn checks_for(ix: &Index, v: &VolumeIndex, recs: &[UsnRecord]) -> Vec<u64> {
         if r.attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
             continue;
         }
+        // inside a skipped folder: not indexed, so nothing to restrict
+        if v.cut().place(r.parent, &r.name, true) == crate::cut::Place::Hidden {
+            continue;
+        }
         let in_profile = v.id(r.parent).is_some_and(|p| {
             let o = ix.owner_uncached(p);
             o != OWNER_NONE && o != OWNER_NOBODY

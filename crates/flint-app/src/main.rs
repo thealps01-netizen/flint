@@ -148,7 +148,24 @@ fn build_sources(extra_folders: &[std::path::PathBuf], index_app_data: bool) -> 
             .with_extra(extra.iter().filter(|f| f.is_dir()).cloned().collect());
         sources::start_local("profile", scope.roots, scope.skip)
     });
-    sources::Sources::new(Box::new(sources::ServicePipe::default()), always, profile)
+    let s = sources::Sources::new(Box::new(sources::ServicePipe::default()), always, profile);
+    // with the service, which leaves out app data folders: those of them
+    // Settings asks for
+    let beside = flint_indexer::folders::beside_service(
+        &flint_indexer::folders::app_data_folders(),
+        index_app_data,
+        &extra_folders
+            .iter()
+            .filter(|f| f.is_dir())
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if beside.is_empty() {
+        return s;
+    }
+    s.beside_service(Box::new(move || {
+        sources::start_local("app data", beside.clone(), Vec::new())
+    }))
 }
 
 #[tauri::command]
@@ -368,7 +385,11 @@ async fn open_settings(app: tauri::AppHandle) {
 /// "Enable full indexing" (Basic mode banner): one administrator prompt
 /// installs and starts the service; Sources reconnects to it by itself.
 #[tauri::command]
-async fn enable_full_indexing(app: tauri::AppHandle) -> Result<commands::Enable, String> {
+async fn enable_full_indexing(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    settings: Option<bool>,
+) -> Result<commands::Enable, String> {
     let r = tauri::async_runtime::spawn_blocking(|| {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         // debug builds run from the build folder; release builds only
@@ -384,9 +405,48 @@ async fn enable_full_indexing(app: tauri::AppHandle) -> Result<commands::Enable,
     })
     .await
     .map_err(|e| e.to_string())?;
-    // Windows' prompt took the focus and hid the launcher: show it again,
-    // with the outcome
-    window::show(&app);
+    if r == Ok(commands::Enable::Done)
+        && let Some(s) = state.sources.get()
+    {
+        s.expect_service();
+    }
+    // Windows' prompt took the focus and hid the window it came from:
+    // show it again, with the outcome
+    if settings == Some(true) {
+        window::open_settings(&app);
+    } else {
+        window::show(&app);
+    }
+    r
+}
+
+/// "Turn off full indexing" (Settings): one administrator prompt stops
+/// and removes the service; Flint goes on in Basic mode.
+#[tauri::command]
+async fn disable_full_indexing(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<commands::Enable, String> {
+    let r = tauri::async_runtime::spawn_blocking(|| {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let pf = if cfg!(debug_assertions) {
+            None
+        } else {
+            Some(flint_indexer::folders::program_files().map_err(|e| e.to_string())?)
+        };
+        let r = commands::disable_full_indexing(&exe, pf.as_deref(), shell::run_elevated);
+        log::line(format!("disable full indexing: {r:?}"));
+        r
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if r == Ok(commands::Enable::Done)
+        && let Some(s) = state.sources.get()
+    {
+        s.forget_service();
+    }
+    // the prompt took the focus: Settings comes back with the outcome
+    window::open_settings(&app);
     r
 }
 
@@ -564,6 +624,7 @@ fn main() {
             clear_history,
             open_settings,
             enable_full_indexing,
+            disable_full_indexing,
             update_state,
             check_update,
             install_update,

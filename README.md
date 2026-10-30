@@ -27,14 +27,18 @@ Flint searches file and folder **names**, not the text inside files.
 4. The installer asks whether to turn on **full indexing**:
    - **Yes (recommended):** a small background service (`FlintIndexer`)
      indexes every NTFS drive and keeps the index up to date.
-   - **No:** Flint indexes only your own folders (basic mode). You can
-     turn full indexing on later from Flint.
+   - **No:** Flint indexes only your own folders (basic mode).
 
-   Basic mode leaves out the hidden app data folders (`AppData`): they
-   hold program caches and settings, and most of a profile's entries,
-   so Windows' own search leaves them out by default too. The Start menu
-   shortcuts kept there are still indexed. **Settings → Search app data
-   folders** brings the rest back (a few games keep their saves there).
+   You can turn full indexing on or off later in **Settings → Indexing**
+   (Windows asks for administrator permission each time).
+
+   Flint leaves out what is inside the hidden app data folders
+   (`AppData`), in both modes and, with full indexing, for every account
+   on the PC: they hold program caches and settings, and most of a
+   disk's entries, so Windows' own search leaves them out by default too.
+   The Start menu shortcuts kept there are still indexed. **Settings →
+   Search app data folders** brings your own app data folders back (a
+   few games keep their saves there).
 
 Needs Windows 10 version 22H2 or Windows 11, 64-bit. The installer adds
 Microsoft's WebView2 runtime if it is missing (it comes with Windows 11).
@@ -93,7 +97,11 @@ for the screen to show it (see app-baseline.md).
 Two targets are **not** met yet and are listed with their causes in
 [indexer-baseline.md](docs/benchmarks/indexer-baseline.md): the service's
 memory (about 660 MB private for 3.5 M entries; target 200 MB) and the
-cost of folder permission checks during the first index.
+cost of folder permission checks during the first index. Since 0.1.2 the
+service leaves out app data folders; on the measured disk that is 59% of
+the entries and of the index memory (rebuilt without administrator
+rights, see the changelog). The service itself has not been measured
+again yet.
 
 No comparison with other search tools is published yet. One will appear
 here only together with its measurement.

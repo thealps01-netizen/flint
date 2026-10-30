@@ -40,6 +40,11 @@ const root = document.getElementById("root")!;
 // folder path, drive name and message goes through esc().
 let s: Settings | null = null;
 let volumes: Volume[] = [];
+/** Which source answers ("service", "userMode", ...; "" until known). */
+let mode = "";
+/** The outcome of "Turn on/off" full indexing, or its error. */
+let fullNote = "";
+let fullBusy = false;
 let errors: Record<string, string> = {};
 let capturing = false;
 let note = "";
@@ -82,6 +87,50 @@ function driveState(v: Volume) {
   const k: Key = v.state === "live" ? "driveLive" : v.state === "basic" ? "driveBasic" : "driveScanning";
   const nf = new Intl.NumberFormat(s?.language === "tr" ? "tr-TR" : "en-US");
   return `<div class="dv"><b>${esc(v.drive)}</b><span class="st ${v.state === "live" ? "live" : ""}">${esc(L(k))}</span><span class="n">${esc(L("driveEntries", nf.format(v.entries)))}</span></div>`;
+}
+
+interface Status {
+  volumes: Volume[];
+  state?: { kind: string };
+}
+
+/** Full indexing is on unless the app runs in Basic mode. */
+function fullRow() {
+  if (!mode) return "";
+  const on = mode !== "userMode";
+  return (
+    `<div class="row"><div class="lb"><b>${esc(L("fullIndexing"))}</b><small>${esc(L(on ? "fullOnHint" : "fullOffHint"))}</small>` +
+    `${fullNote ? `<span class="ok" role="status">${esc(fullNote)}</span>` : ""}${err("full")}</div>` +
+    `<button class="btn" id="full"${fullBusy ? " disabled" : ""}>${esc(L(on ? "turnOff" : "turnOn"))}</button></div>`
+  );
+}
+
+async function readStatus() {
+  const st = await invoke<Status>("status").catch(() => null);
+  if (!st) return false;
+  const changed = JSON.stringify(st.volumes) !== JSON.stringify(volumes) || (st.state?.kind ?? "") !== mode;
+  volumes = st.volumes;
+  mode = st.state?.kind ?? "";
+  return changed;
+}
+
+async function toggleFull() {
+  const off = mode !== "userMode";
+  fullBusy = true;
+  fullNote = "";
+  delete errors.full;
+  render();
+  try {
+    const r = off
+      ? await invoke<"done" | "declined">("disable_full_indexing")
+      : await invoke<"done" | "declined">("enable_full_indexing", { settings: true });
+    fullNote = L(r === "declined" ? "fullUnchanged" : off ? "fullOff" : "fullEnabled");
+  } catch (m) {
+    errors.full = String(m);
+  }
+  fullBusy = false;
+  await readStatus();
+  render();
 }
 
 function updatesCard() {
@@ -129,6 +178,7 @@ function render() {
       ["tr", "Türkçe"],
     ])}</div></div>` +
     `<h2>${esc(L("secIndex"))}</h2><div class="card">` +
+    fullRow() +
     `<div class="row col"><div class="lb"><b>${esc(L("drives"))}</b></div><div>${volumes.map(driveState).join("") || esc(L("none"))}</div></div>` +
     `<div class="row col"><div class="lb"><b>${esc(L("excluded"))}</b><small>${esc(L("excludedHint"))}</small></div>${folders("excludedFolders", s.excludedFolders)}</div>` +
     `<div class="row col"><div class="lb"><b>${esc(L("extraFolders"))}</b><small>${esc(L("extraHint"))}</small></div>${folders("extraFolders", s.extraFolders)}</div>` +
@@ -182,6 +232,7 @@ root.addEventListener("click", async (e) => {
   } else if (el.id === "startup") void save({ launchAtStartup: !s.launchAtStartup });
   else if (el.id === "recent") void save({ useWindowsRecent: !s.useWindowsRecent });
   else if (el.id === "appdata") void save({ indexAppData: !s.indexAppData });
+  else if (el.id === "full" && !fullBusy) void toggleFull();
   else if (el.id === "updates") void save({ checkUpdates: !s.checkUpdates });
   else if (el.id === "check-update" && upd) {
     updBusy = true;
@@ -266,7 +317,7 @@ document.addEventListener("keydown", (e) => {
 
 async function load() {
   s = await invoke<Settings>("get_settings");
-  volumes = (await invoke<{ volumes: Volume[] }>("status").catch(() => null))?.volumes ?? [];
+  await readStatus();
   upd = await invoke<UpdateState>("update_state").catch(() => null);
   render();
 }
@@ -276,10 +327,6 @@ listen<Settings>("flint://settings", (e) => {
 });
 // drive progress stays current while the window is open
 window.setInterval(async () => {
-  const st = await invoke<{ volumes: Volume[] }>("status").catch(() => null);
-  if (st && !capturing && JSON.stringify(st.volumes) !== JSON.stringify(volumes)) {
-    volumes = st.volumes;
-    render();
-  }
+  if ((await readStatus()) && !capturing) render();
 }, 3000);
 void load();
