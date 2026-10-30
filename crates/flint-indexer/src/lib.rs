@@ -10,6 +10,7 @@ pub mod engine;
 #[cfg(windows)]
 pub mod folders;
 pub mod log;
+pub mod ntfs;
 #[cfg(windows)]
 pub mod pipe;
 pub mod privacy;

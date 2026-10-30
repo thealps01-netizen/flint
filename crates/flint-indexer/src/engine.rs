@@ -18,7 +18,7 @@ use crate::snapshot::{self, SnapshotError, VolumeSnapshot};
 use crate::volindex::VolumeIndex;
 use crate::volume::{self, JournalInfo, Replay, Volume};
 use crate::walk::{self, FsEvent, PathMap, Skip};
-use crate::{log, watch};
+use crate::{log, ntfs, watch};
 use flint_core::Index;
 use std::io;
 use std::path::PathBuf;
@@ -714,6 +714,7 @@ fn start_service(cfg: Config) -> io::Result<Engine> {
             app_data: cfg.app_data,
             state: slot.clone(),
             all: states.clone(),
+            descriptors: Mutex::default(),
         };
         let t = std::thread::Builder::new()
             .name(format!("flint-journal-{}", v.drive))
@@ -782,6 +783,54 @@ struct VolCtx {
     app_data: bool,
     state: Arc<Mutex<VolState>>,
     all: Vec<Arc<Mutex<VolState>>>,
+    descriptors: Mutex<Descriptors>,
+}
+
+/// The stored security descriptors (`$Secure:$SDS`) of a volume's
+/// folders by security id, for checking them without opening them: those
+/// a scan used, and those read for a folder whose id is not among them (a
+/// new id comes with a new set of permissions: rare), at most every
+/// `DESCRIPTORS_AGAIN`.
+#[derive(Default)]
+struct Descriptors {
+    map: std::collections::HashMap<u32, Vec<u8>>,
+    read_at: Option<Instant>,
+}
+
+const DESCRIPTORS_AGAIN: Duration = Duration::from_secs(10);
+
+impl Descriptors {
+    fn for_id(
+        &mut self,
+        sid: u32,
+        read: impl FnOnce() -> io::Result<std::collections::HashMap<u32, Vec<u8>>>,
+    ) -> &std::collections::HashMap<u32, Vec<u8>> {
+        if !self.map.contains_key(&sid)
+            && self
+                .read_at
+                .is_none_or(|t| t.elapsed() >= DESCRIPTORS_AGAIN)
+        {
+            self.read_at = Some(Instant::now());
+            if let Ok(mut all) = read() {
+                // only the ids in use are kept (all of them: a few MiB)
+                let keep: Vec<u32> = self.map.keys().copied().chain([sid]).collect();
+                self.map = keep
+                    .into_iter()
+                    .filter_map(|k| all.remove_entry(&k))
+                    .collect();
+            }
+        }
+        &self.map
+    }
+}
+
+/// The security id in the MFT record of the folder `frn` (no folder is
+/// opened); None when the record is another file's by now.
+fn folder_sid(v: &Volume, frn: u64) -> Option<u32> {
+    let rec = v.file_record(frn).ok()?;
+    (ntfs::frn_of(&rec, frn) == Some(frn))
+        .then(|| ntfs::folder_security_id(&rec))
+        .flatten()
 }
 
 /// The folders `drive` leaves out: every profile's app data folders,
@@ -812,24 +861,34 @@ fn refresh_status(ctx: &VolCtx) {
     publish_status(&ctx.shared, &refs);
 }
 
-/// Checks one folder by FRN for the access rules.
-fn check_frn(
-    v: &Volume,
+/// One folder's verdict: from its stored descriptor when its security id
+/// has one (nothing is opened), else by opening the folder with `open`.
+/// The flag tells whether it was opened.
+fn check_one(
     checker: &mut privacy::os::AccessChecker,
     frn: u64,
-) -> io::Result<Verdict> {
-    let h = v.open_by_id(frn)?;
-    checker.check_handle(&h)
+    sid: Option<u32>,
+    descriptors: &std::collections::HashMap<u32, Vec<u8>>,
+    open: impl FnOnce(u64) -> io::Result<volume::Handle>,
+) -> (io::Result<Verdict>, bool) {
+    if let Some(sd) = sid.and_then(|s| descriptors.get(&s))
+        && let Ok(v) = checker.check_descriptor(sd)
+    {
+        return (Ok(v), false);
+    }
+    (open(frn).and_then(|h| checker.check_handle(&h)), true)
 }
 
-/// Verdicts for `frns`, in order: one open per distinct security id
-/// (folders without one are opened each), spread over a few threads.
-/// Returns the verdicts and the number of folders opened.
+/// Verdicts for `frns`, in order: one check per distinct security id,
+/// from its stored descriptor (folders without one, or whose descriptor
+/// is missing, are opened), spread over a few threads. Returns the
+/// verdicts and the number of folders opened.
 fn check_all(
     v: &Volume,
     stop: &AtomicBool,
     frns: &[u64],
     sids: &std::collections::HashMap<u64, u32>,
+    descriptors: &std::collections::HashMap<u32, Vec<u8>>,
 ) -> (Vec<io::Result<Verdict>>, usize) {
     use std::collections::HashMap;
     use std::collections::hash_map::Entry;
@@ -851,7 +910,7 @@ fn check_all(
         .map_or(4, |n| n.get())
         .clamp(1, 8);
     let chunk = to_open.len().div_ceil(threads).max(1);
-    let opened: Vec<(usize, io::Result<Verdict>)> = std::thread::scope(|s| {
+    let checked: Vec<(usize, io::Result<Verdict>, bool)> = std::thread::scope(|s| {
         let workers: Vec<_> = to_open
             .chunks(chunk)
             .map(|part| {
@@ -859,15 +918,19 @@ fn check_all(
                     let mut checker = privacy::os::AccessChecker::new();
                     part.iter()
                         .map(|&i| {
-                            let r = if stop.load(Ordering::Relaxed) {
-                                Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"))
+                            let (r, opened) = if stop.load(Ordering::Relaxed) {
+                                let e = io::Error::new(io::ErrorKind::Interrupted, "stopped");
+                                (Err(e), false)
                             } else {
                                 match &mut checker {
-                                    Ok(c) => check_frn(v, c, frns[i]),
-                                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                                    Ok(c) => {
+                                        let sid = sids.get(&frns[i]).copied();
+                                        check_one(c, frns[i], sid, descriptors, |f| v.open_by_id(f))
+                                    }
+                                    Err(e) => (Err(io::Error::new(e.kind(), e.to_string())), false),
                                 }
                             };
-                            (i, r)
+                            (i, r, opened)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -878,9 +941,9 @@ fn check_all(
             .flat_map(|w| w.join().unwrap_or_default())
             .collect()
     });
-    let n = opened.len();
+    let n = checked.iter().filter(|c| c.2).count();
     let mut by_index: Vec<Option<io::Result<Verdict>>> = (0..frns.len()).map(|_| None).collect();
-    for (i, r) in opened {
+    for (i, r, _) in checked {
         by_index[i] = Some(r);
     }
     let copy = |r: &io::Result<Verdict>| match r {
@@ -930,6 +993,28 @@ fn scan_volume(v: &Volume, ctx: &VolCtx, journal: JournalInfo) -> bool {
     let found = records.len();
     cut.filter(root, &mut records);
     let left_out = found - records.len();
+    // every folder's security id from the MFT and the descriptors from
+    // $Secure: folders are checked without being opened (opening each
+    // leaves kernel memory behind in some file system filters, for as
+    // long as Windows runs)
+    let descriptors = match v.folder_security_ids(&ctx.stop) {
+        Ok(ids) => {
+            for r in records.iter_mut().filter(|r| r.is_dir()) {
+                if let Ok(i) = ids.binary_search_by_key(&r.frn, |x| x.0) {
+                    r.security_id = ids[i].1;
+                }
+            }
+            v.security_descriptors().unwrap_or_else(|e| {
+                log::line(format!("{drive}: security descriptors not read ({e})"));
+                Default::default()
+            })
+        }
+        Err(_) if ctx.stop.load(Ordering::Relaxed) => return false,
+        Err(e) => {
+            log::line(format!("{drive}: folder security ids not read ({e})"));
+            Default::default()
+        }
+    };
     // folders with the same security id share one descriptor: one check
     // per id (budget +20 % of the first index)
     let sids: std::collections::HashMap<u64, u32> = records
@@ -945,12 +1030,20 @@ fn scan_volume(v: &Volume, ctx: &VolCtx, journal: JournalInfo) -> bool {
     let built = t.elapsed();
     let mut opened = 0usize;
     let stats = access::first_pass_batch(&mut ix, &vi, |frns| {
-        let (verdicts, n) = check_all(v, &ctx.stop, frns, &sids);
+        let (verdicts, n) = check_all(v, &ctx.stop, frns, &sids, &descriptors);
         opened = n;
         verdicts
     });
     if ctx.stop.load(Ordering::Relaxed) {
         return false;
+    }
+    // those in use are kept for the folders the journal brings
+    let used: std::collections::HashSet<u32> = sids.values().copied().collect();
+    let mut descriptors = descriptors;
+    descriptors.retain(|id, _| used.contains(id));
+    if let Ok(mut d) = ctx.descriptors.lock() {
+        d.map = descriptors;
+        d.read_at = Some(Instant::now());
     }
     let checked = t.elapsed();
     log::line(format!(
@@ -1308,7 +1401,20 @@ fn apply_batch(
         Err(_) => return false,
     };
     let verdicts: Vec<(u64, io::Result<Verdict>)> = match checker {
-        Some(c) => todo.into_iter().map(|f| (f, check_frn(v, c, f))).collect(),
+        Some(c) => {
+            // only a cache: one poisoned by a panic is used as it is
+            let mut d = ctx.descriptors.lock().unwrap_or_else(|e| e.into_inner());
+            todo.into_iter()
+                .map(|f| {
+                    let sid = folder_sid(v, f);
+                    let known = match sid {
+                        Some(s) => d.for_id(s, || v.security_descriptors()),
+                        None => &d.map,
+                    };
+                    (f, check_one(c, f, sid, known, |f| v.open_by_id(f)).0)
+                })
+                .collect()
+        }
         None => todo
             .into_iter()
             .map(|f| (f, Err(io::Error::other("access checks unavailable"))))
@@ -1498,6 +1604,79 @@ mod tests {
             saved.iter().map(|v| v.drive.as_str()).collect::<Vec<_>>(),
             ["D:"]
         );
+    }
+
+    /// Descriptors are read again for an id not among them, not for a
+    /// known one, and not twice within `DESCRIPTORS_AGAIN`.
+    #[test]
+    fn descriptors_are_read_again_only_for_a_new_id() {
+        use std::collections::{HashMap, HashSet};
+        let mut d = Descriptors::default();
+        let reads = std::cell::Cell::new(0);
+        let read = |ids: &[u32]| {
+            reads.set(reads.get() + 1);
+            Ok(ids
+                .iter()
+                .map(|&i| (i, vec![i as u8]))
+                .collect::<HashMap<_, _>>())
+        };
+        let keys = |d: &Descriptors| d.map.keys().copied().collect::<HashSet<_>>();
+        assert!(d.for_id(5, || read(&[5, 6])).contains_key(&5));
+        assert_eq!(reads.get(), 1);
+        assert_eq!(
+            keys(&d),
+            HashSet::from([5]),
+            "only the ids asked for are kept"
+        );
+        assert!(d.for_id(5, || read(&[5, 6])).contains_key(&5));
+        assert_eq!(reads.get(), 1, "known id: not read again");
+        assert!(!d.for_id(7, || read(&[5, 6, 7])).contains_key(&7));
+        assert_eq!(reads.get(), 1, "within DESCRIPTORS_AGAIN of the last read");
+        d.read_at = Some(Instant::now() - DESCRIPTORS_AGAIN);
+        assert!(d.for_id(7, || read(&[5, 6, 7])).contains_key(&7));
+        assert_eq!(reads.get(), 2);
+        assert_eq!(keys(&d), HashSet::from([5, 7]));
+        d.read_at = Some(Instant::now() - DESCRIPTORS_AGAIN);
+        let failed = d.for_id(8, || Err(io::Error::other("unreadable")));
+        assert!(failed.contains_key(&7), "a failed read keeps what was read");
+    }
+
+    /// A folder whose security id has a stored descriptor is decided
+    /// from it and never opened; without one (no id, unknown id, bytes
+    /// that do not parse) it is opened.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_with_a_stored_descriptor_is_not_opened() {
+        use std::collections::HashMap;
+        let me = current_user_sid().unwrap();
+        let base = std::env::temp_dir().join(format!("flint-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.join("ortak");
+        privacy::os::secure_dir(
+            &dir,
+            &format!("O:{me}D:P(A;OICI;FA;;;{me})(A;OICI;0x1200a9;;;BU)"),
+            &[&me],
+        )
+        .unwrap();
+        let mut c = privacy::os::AccessChecker::new().unwrap();
+        let live = c.check_path(&dir).unwrap();
+        let sd = privacy::os::descriptor_bytes(&dir).unwrap();
+        let known = HashMap::from([(7u32, sd), (8u32, vec![1u8, 0, 4, 0x80])]);
+        let never = |_| -> io::Result<volume::Handle> { panic!("opened a folder") };
+        let (v, opened) = check_one(&mut c, 42, Some(7), &known, never);
+        assert_eq!((v.unwrap(), opened), (live, false));
+        let refused = |_| -> io::Result<volume::Handle> { Err(io::Error::other("opened")) };
+        for (sid, what) in [
+            (None, "no id"),
+            (Some(9), "unknown id"),
+            (Some(8), "malformed"),
+        ] {
+            let (v, opened) = check_one(&mut c, 42, sid, &known, refused);
+            assert!(opened, "{what}");
+            assert_eq!(v.unwrap_err().to_string(), "opened", "{what}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
