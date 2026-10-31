@@ -4,7 +4,9 @@
 //! NTFS volume from its MFT (needs administrator rights), prints entries,
 //! time and memory, optionally saves a snapshot and follows the change
 //! journal for SECS seconds, printing each change with its path.
-//! `flint-indexer query TEXT` asks the running indexer.
+//! `flint-indexer query TEXT` asks every running indexer, as the app sees
+//! them; `flint-indexer mcp` serves the same search to AI assistants
+//! (Model Context Protocol over stdio).
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -29,13 +31,17 @@ enum Cmd {
         #[arg(long)]
         follow: Option<u64>,
     },
-    /// Ask the running indexer (service first, then this user's) and
-    /// print the results.
+    /// Search every running Flint index (the service, the app's own
+    /// indexers) and print the paths. Folders hidden from assistants in
+    /// Flint's settings are left out.
     Query {
         text: String,
         #[arg(long, default_value_t = 10)]
         limit: u32,
     },
+    /// Serve Flint's search to an AI assistant (MCP over stdin/stdout,
+    /// no network): one read-only tool returning names and paths only.
+    Mcp,
     /// Print the running indexer's state (mode, volumes, entries).
     Status,
     /// Run the indexer in this console until Ctrl+C. Without
@@ -74,6 +80,7 @@ fn main() -> ExitCode {
             follow,
         } => scan::run(&drive, snapshot.as_deref(), follow),
         Cmd::Query { text, limit } => query(&text, limit),
+        Cmd::Mcp => mcp(),
         Cmd::Status => status(),
         Cmd::Serve {
             user_mode,
@@ -292,29 +299,32 @@ fn connect() -> std::io::Result<flint_indexer::pipe::Client> {
     flint_indexer::pipe::Client::connect_any()
 }
 
+/// What assistants must not be shown, read again for every search so a
+/// change in Flint's settings applies at once; when it cannot be read,
+/// nothing is shown.
+#[cfg(windows)]
+fn hidden() -> std::io::Result<Vec<String>> {
+    flint_indexer::ask::hidden_for_assistants().map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("Flint's settings cannot be read ({e}), so nothing is shown"),
+        )
+    })
+}
+
 #[cfg(windows)]
 fn query(text: &str, limit: u32) -> ExitCode {
-    use flint_indexer::protocol::ServerMsg;
-    let c = match connect() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(4);
-        }
-    };
-    match c.query(text, limit, vec![]) {
-        Ok(ServerMsg::Results {
-            total,
-            elapsed_us,
-            hits,
-            ..
-        }) => {
+    let t = std::time::Instant::now();
+    let found = hidden().and_then(|h| flint_indexer::ask::search_everywhere(text, limit, &h));
+    match found {
+        Ok(f) => {
             println!(
-                "{total} matches, {:.1} ms ({} indexer)",
-                elapsed_us as f64 / 1000.0,
-                c.mode
+                "{}{} matches, {:.1} ms",
+                if f.exact { "" } else { "at least " },
+                f.total,
+                t.elapsed().as_secs_f64() * 1000.0
             );
-            for (i, h) in hits.iter().enumerate() {
+            for (i, h) in f.hits.iter().enumerate() {
                 println!(
                     "{:>2}. {}{}",
                     i + 1,
@@ -322,14 +332,55 @@ fn query(text: &str, limit: u32) -> ExitCode {
                     if h.typo { "   [typo]" } else { "" }
                 );
             }
+            if f.failed > 0 {
+                eprintln!("{} of Flint's indexes did not answer in time", f.failed);
+            }
             ExitCode::SUCCESS
         }
-        Ok(other) => {
-            eprintln!("unexpected answer: {other:?}");
-            ExitCode::from(2)
-        }
         Err(e) => {
-            eprintln!("query failed: {e}");
+            eprintln!("{e}");
+            // 4: no index answered (as before); 2: anything else
+            if e.kind() == std::io::ErrorKind::NotConnected {
+                ExitCode::from(4)
+            } else {
+                ExitCode::from(2)
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn mcp() -> ExitCode {
+    eprintln!("flint-indexer runs on Windows only");
+    ExitCode::from(2)
+}
+
+/// Searches the running indexers for the MCP server.
+#[cfg(windows)]
+struct Live;
+
+#[cfg(windows)]
+impl flint_indexer::mcp::Searcher for Live {
+    fn search(&self, text: &str, limit: u32) -> Result<flint_indexer::ask::Found, String> {
+        hidden()
+            .and_then(|h| flint_indexer::ask::search_everywhere(text, limit, &h))
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn mcp() -> ExitCode {
+    // stdout carries the protocol only; this goes to stderr, with no names
+    eprintln!("flint mcp {}: serving on stdio", env!("CARGO_PKG_VERSION"));
+    let mut server = flint_indexer::mcp::Server::new(Live);
+    match flint_indexer::mcp::serve(
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+        &mut server,
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("flint mcp: {e}");
             ExitCode::from(2)
         }
     }

@@ -704,8 +704,14 @@ pub fn serve(
 /// Opens the client end of `name` with identification-level impersonation
 /// (the server may read who we are, never act as us).
 pub fn connect_raw(name: &str) -> io::Result<PipeConn> {
+    connect_raw_waiting(name, 5, 2000)
+}
+
+/// [`connect_raw`] that waits for a busy pipe `tries` times, up to
+/// `wait_ms` each, and tries again after each wait.
+fn connect_raw_waiting(name: &str, tries: u32, wait_ms: u32) -> io::Result<PipeConn> {
     let w = wide(name);
-    for _ in 0..5 {
+    for attempt in 0..=tries {
         // SAFETY: w is NUL-terminated; null security attributes/template.
         let h = unsafe {
             CreateFileW(
@@ -728,8 +734,11 @@ pub fn connect_raw(name: &str) -> io::Result<PipeConn> {
         if e.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
             return Err(e);
         }
-        // SAFETY: w is NUL-terminated; waits up to 2 s for a free instance.
-        unsafe { WaitNamedPipeW(w.as_ptr(), 2000) };
+        if attempt == tries {
+            break;
+        }
+        // SAFETY: w is NUL-terminated; waits up to wait_ms for a free instance.
+        unsafe { WaitNamedPipeW(w.as_ptr(), wait_ms) };
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -774,7 +783,18 @@ impl Client {
     /// single query) and exchanges `Hello`; a version
     /// mismatch is an error naming both versions.
     pub fn connect(name: &str, expected_owner: &str) -> io::Result<Client> {
-        let conn = connect_raw(name)?;
+        Client::open(connect_raw(name)?, name, expected_owner)
+    }
+
+    /// [`Client::connect`] that gives up on a pipe that stays busy, or does
+    /// not greet, within about `ms` (each read after that waits `ms` too).
+    pub fn connect_within(name: &str, expected_owner: &str, ms: u32) -> io::Result<Client> {
+        let conn = connect_raw_waiting(name, 1, ms)?;
+        crate::server::Conn::set_read_timeout(&conn, Some(ms));
+        Client::open(conn, name, expected_owner)
+    }
+
+    fn open(conn: PipeConn, name: &str, expected_owner: &str) -> io::Result<Client> {
         let owner = pipe_owner(conn.h.raw())?;
         if !owner.eq_ignore_ascii_case(expected_owner) {
             crate::log::line(format!(
@@ -902,4 +922,64 @@ pub fn serve_index(
         sddl,
         Arc::new(move |c: Arc<PipeConn>| crate::server::handle(c as Arc<dyn Conn>, shared.clone())),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+
+    /// One instance only: a second client finds the pipe busy until the
+    /// first leaves.
+    #[test]
+    fn a_pipe_busy_for_a_moment_is_connected_once_free() {
+        let name = format!(r"\\.\pipe\flint-test-busy-{}", std::process::id());
+        let w = wide(&name);
+        let (ready, go) = mpsc::channel::<()>();
+        let (left, gone) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            // SAFETY: w is NUL-terminated; default security, one instance.
+            let h = unsafe {
+                CreateNamedPipeW(
+                    w.as_ptr(),
+                    windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_WAIT,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(h, INVALID_HANDLE_VALUE);
+            ready.send(()).unwrap();
+            // SAFETY: h is the pipe made above; blocking (not overlapped).
+            unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
+            gone.recv().unwrap();
+            // SAFETY: as above.
+            unsafe {
+                DisconnectNamedPipe(h);
+                ConnectNamedPipe(h, std::ptr::null_mut());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            // SAFETY: owned here only.
+            drop(unsafe { Handle::from_raw(h) });
+        });
+        go.recv().unwrap();
+        let first = connect_raw_waiting(&name, 1, 500).expect("the free instance");
+        let t = Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(first);
+            left.send(()).unwrap();
+        });
+        let second = connect_raw_waiting(&name, 1, 3000);
+        assert!(second.is_ok(), "{:?} after {:?}", second.err(), t.elapsed());
+        release.join().unwrap();
+        server.join().unwrap();
+    }
 }

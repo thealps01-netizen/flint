@@ -7,8 +7,8 @@ use std::io;
 use std::path::PathBuf;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
-    FOLDERID_Programs, FOLDERID_RoamingAppData, SHGetKnownFolderPath,
+    FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_Profile, FOLDERID_ProgramData,
+    FOLDERID_ProgramFiles, FOLDERID_Programs, FOLDERID_RoamingAppData, SHGetKnownFolderPath,
 };
 use windows_sys::core::{GUID, PWSTR};
 
@@ -27,6 +27,16 @@ fn known(id: &GUID) -> io::Result<PathBuf> {
             io::Error::other(format!("known folder not available (HRESULT {hr:#x})"))
         })
     }
+}
+
+/// The roaming app data folder (`%APPDATA%` unless that was changed).
+pub fn roaming_app_data() -> io::Result<PathBuf> {
+    known(&FOLDERID_RoamingAppData)
+}
+
+/// The user folder (`%USERPROFILE%` unless that was changed).
+pub fn profile() -> io::Result<PathBuf> {
+    known(&FOLDERID_Profile)
 }
 
 /// `C:\Program Files` (64-bit programs).

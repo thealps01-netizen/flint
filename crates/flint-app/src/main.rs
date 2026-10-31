@@ -134,7 +134,7 @@ fn build_sources(extra_folders: &[std::path::PathBuf], index_app_data: bool) -> 
         .collect();
     let mut always = Vec::new();
     if !other.is_empty() {
-        match sources::start_local("drives", other, Vec::new()) {
+        match sources::start_local(flint_indexer::ask::TAG_DRIVES, other, Vec::new()) {
             Ok(b) => always.push(b),
             Err(e) => log::line(format!("drives without NTFS are not indexed: {e}")),
         }
@@ -146,7 +146,7 @@ fn build_sources(extra_folders: &[std::path::PathBuf], index_app_data: bool) -> 
         let home = std::env::var_os("USERPROFILE").ok_or("USERPROFILE is not set")?;
         let scope = flint_indexer::folders::user_scope(home.into(), index_app_data)
             .with_extra(extra.iter().filter(|f| f.is_dir()).cloned().collect());
-        sources::start_local("profile", scope.roots, scope.skip)
+        sources::start_local(flint_indexer::ask::TAG_PROFILE, scope.roots, scope.skip)
     });
     let s = sources::Sources::new(Box::new(sources::ServicePipe::default()), always, profile);
     // with the service, which leaves out app data folders: those of them
@@ -164,7 +164,7 @@ fn build_sources(extra_folders: &[std::path::PathBuf], index_app_data: bool) -> 
         return s;
     }
     s.beside_service(Box::new(move || {
-        sources::start_local("app data", beside.clone(), Vec::new())
+        sources::start_local(flint_indexer::ask::TAG_APP_DATA, beside.clone(), Vec::new())
     }))
 }
 

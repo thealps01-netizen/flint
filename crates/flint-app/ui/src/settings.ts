@@ -13,9 +13,11 @@ interface Settings {
   useWindowsRecent: boolean;
   extraFolders: string[];
   excludedFolders: string[];
+  aiHiddenFolders: string[];
   indexAppData: boolean;
   checkUpdates: boolean;
 }
+type FolderList = "extraFolders" | "excludedFolders" | "aiHiddenFolders";
 interface UpdateInfo {
   version: string;
   notes: string;
@@ -181,6 +183,7 @@ function render() {
     fullRow() +
     `<div class="row col"><div class="lb"><b>${esc(L("drives"))}</b></div><div>${volumes.map(driveState).join("") || esc(L("none"))}</div></div>` +
     `<div class="row col"><div class="lb"><b>${esc(L("excluded"))}</b><small>${esc(L("excludedHint"))}</small></div>${folders("excludedFolders", s.excludedFolders)}</div>` +
+    `<div class="row col"><div class="lb"><b>${esc(L("aiHidden"))}</b><small>${esc(L("aiHiddenHint"))}</small></div>${folders("aiHiddenFolders", s.aiHiddenFolders)}</div>` +
     `<div class="row col"><div class="lb"><b>${esc(L("extraFolders"))}</b><small>${esc(L("extraHint"))}</small></div>${folders("extraFolders", s.extraFolders)}</div>` +
     `<div class="row"><div class="lb"><b>${esc(L("appData"))}</b><small>${esc(L("appDataHint"))}</small></div>${sw("appdata", s.indexAppData, "appData")}</div></div>` +
     `<h2>${esc(L("secHistory"))}</h2><div class="card">` +
@@ -267,13 +270,13 @@ root.addEventListener("click", async (e) => {
   } else if (el.dataset.v && el.parentElement?.id === "theme") void save({ theme: el.dataset.v as Settings["theme"] });
   else if (el.dataset.v && el.parentElement?.id === "language") void save({ language: el.dataset.v as Lang });
   else if (el.dataset.add) {
-    const field = el.dataset.add as "extraFolders" | "excludedFolders";
+    const field = el.dataset.add as FolderList;
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked === "string" && !s[field].some((f) => f.toLowerCase() === picked.toLowerCase())) {
       void save({ [field]: [...s[field], picked] });
     }
   } else if (el.dataset.rm) {
-    const [field, i] = el.dataset.rm.split(":") as ["extraFolders" | "excludedFolders", string];
+    const [field, i] = el.dataset.rm.split(":") as [FolderList, string];
     const n = Number(i);
     focusNext = [`rm-${field}-${n}`, `rm-${field}-${n - 1}`, `add-${field}`];
     void save({ [field]: s[field].filter((_, j) => j !== n) });

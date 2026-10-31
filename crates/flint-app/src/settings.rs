@@ -39,6 +39,9 @@ pub struct Settings {
     pub extra_folders: Vec<PathBuf>,
     /// Never shown in results.
     pub excluded_folders: Vec<PathBuf>,
+    /// Never shown to AI assistants (the MCP server, `flint-indexer
+    /// query`); still shown in Flint's own results.
+    pub ai_hidden_folders: Vec<PathBuf>,
     /// Basic mode walks the hidden app data folders too (from the next
     /// start). Off: they hold program caches, not the user's files.
     pub index_app_data: bool,
@@ -56,6 +59,8 @@ impl Default for Settings {
             use_windows_recent: true,
             extra_folders: Vec::new(),
             excluded_folders: Vec::new(),
+            // the key stores in the user folder; the user may remove them
+            ai_hidden_folders: flint_indexer::ask::default_ai_hidden().unwrap_or_default(),
             index_app_data: false,
             check_updates: true,
         }
@@ -64,7 +69,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn default_file() -> Option<PathBuf> {
-        std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Flint").join("settings.json"))
+        flint_indexer::ask::settings_file()
     }
 
     pub fn load(file: &Path) -> Settings {
@@ -94,27 +99,9 @@ impl Settings {
     }
 }
 
-/// Whether `path` lies in one of `excluded` (case-insensitive, whole
-/// folder names only: `C:\Data` covers `C:\Data\x`, not `C:\Database`).
-pub fn is_excluded(path: &str, excluded: &[String]) -> bool {
-    if excluded.is_empty() {
-        return false;
-    }
-    let p = path.to_lowercase();
-    excluded.iter().any(|ex| {
-        p.strip_prefix(ex.as_str())
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
-    })
-}
-
-/// Excluded folders in the form `is_excluded` compares.
-pub fn exclusion_keys(folders: &[PathBuf]) -> Vec<String> {
-    folders
-        .iter()
-        .map(|f| f.to_string_lossy().trim_end_matches('\\').to_lowercase())
-        .filter(|f| !f.is_empty())
-        .collect()
-}
+/// Whether a path lies in one of the excluded folders (whole folder
+/// names, case-insensitive), and those folders in the form it compares.
+pub use flint_indexer::ask::{folder_keys as exclusion_keys, is_within as is_excluded};
 
 /// Registers and unregisters global hotkeys (the shortcut plugin in the
 /// app, a fake in tests).
@@ -162,6 +149,10 @@ mod tests {
         assert!(s.use_windows_recent);
         assert!(s.check_updates);
         assert!(s.extra_folders.is_empty() && s.excluded_folders.is_empty());
+        assert_eq!(
+            s.ai_hidden_folders,
+            flint_indexer::ask::default_ai_hidden().unwrap()
+        );
         assert!(!s.index_app_data);
         // a missing file is the defaults too
         assert_eq!(Settings::load(&temp("missing").join("settings.json")), s);
@@ -178,6 +169,7 @@ mod tests {
             use_windows_recent: false,
             extra_folders: vec![r"D:\Projeler".into()],
             excluded_folders: vec![r"C:\Users\x\node_modules".into()],
+            ai_hidden_folders: vec![r"C:\Users\x\Private".into()],
             index_app_data: true,
             check_updates: false,
         };
@@ -261,19 +253,23 @@ mod tests {
     }
 
     #[test]
-    fn excluded_folder_filters_at_boundary() {
-        let ex = exclusion_keys(&[r"C:\Data\".into(), r"c:\users\x\node_modules".into()]);
-        assert!(is_excluded(r"C:\Data", &ex));
-        assert!(is_excluded(r"C:\Data\x", &ex));
-        assert!(is_excluded(r"c:\DATA\x\y.txt", &ex));
-        assert!(!is_excluded(r"C:\Database\x", &ex));
-        assert!(!is_excluded(r"C:\Dat", &ex));
-        assert!(is_excluded(r"C:\Users\X\node_modules\a\b.js", &ex));
-        assert!(!is_excluded(r"C:\Users\X\node_modules2\b.js", &ex));
-        // a whole drive
-        let root = exclusion_keys(&[r"E:\".into()]);
-        assert!(is_excluded(r"E:\a.txt", &root));
-        assert!(!is_excluded(r"EE:\a.txt", &root));
-        assert!(!is_excluded(r"C:\a.txt", &[]));
+    fn the_folders_hidden_from_assistants_are_read_from_what_the_app_saves() {
+        // flint-indexer reads these two lists from the same file (the MCP
+        // server and `flint-indexer query`): a renamed field would show
+        // hidden folders to assistants
+        let f = std::env::temp_dir()
+            .join(format!("flint-settings-ai-{}", std::process::id()))
+            .join("settings.json");
+        let s = Settings {
+            excluded_folders: vec![r"C:\Data".into()],
+            ai_hidden_folders: vec![r"C:\Users\X\Private".into()],
+            ..Settings::default()
+        };
+        s.save(&f).unwrap();
+        let hidden = flint_indexer::ask::hidden_from_assistants(Some(&f)).unwrap();
+        assert!(is_excluded(r"C:\Data\a.txt", &hidden));
+        assert!(is_excluded(r"C:\Users\X\Private\b.txt", &hidden));
+        // the app's own results leave out only the excluded folders
+        assert_eq!(exclusion_keys(&s.excluded_folders), [r"c:\data"]);
     }
 }

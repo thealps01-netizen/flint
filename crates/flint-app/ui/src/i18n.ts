@@ -63,6 +63,9 @@ const en = {
     "Indexed besides your user folder in Basic mode; with full indexing, only ones inside app data folders need adding. Applies after Flint restarts.",
   excluded: "Excluded folders",
   excludedHint: "Never shown in results.",
+  aiHidden: "Hidden from AI assistants",
+  aiHiddenHint:
+    "Flint's search for AI assistants (its MCP server) never returns these folders; Flint itself still shows them. An assistant with its own file access can still open them.",
   appData: "Search app data folders",
   appDataHint:
     "Hidden AppData folders: program caches and settings, some game saves. Uses much more memory. Applies after Flint restarts.",
@@ -163,6 +166,9 @@ const tr: typeof en = {
     "Temel modda kullanıcı klasörünüze ek olarak dizinlenir; tam dizinlemede yalnızca program verisi klasörlerinin içindekileri eklemeniz gerekir. Flint yeniden başlayınca geçerli olur.",
   excluded: "Hariç tutulan klasörler",
   excludedHint: "Sonuçlarda hiç gösterilmez.",
+  aiHidden: "Yapay zekâdan gizli klasörler",
+  aiHiddenHint:
+    "Flint'in yapay zekâ asistanlarına açtığı arama (MCP sunucusu) bu klasörleri hiç döndürmez; Flint'in kendisi göstermeye devam eder. Kendi dosya erişimi olan bir asistan bu klasörleri yine açabilir.",
   appData: "Program verisi klasörlerini de ara",
   appDataHint:
     "Gizli AppData klasörleri: program önbellekleri ve ayarları, bazı oyun kayıtları. Çok daha fazla bellek kullanır. Flint yeniden başlayınca geçerli olur.",
