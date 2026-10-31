@@ -70,6 +70,32 @@ Var FlintTries
   ${Loop}
 !macroend
 
+; flint-indexer.exe may be running outside the service: an AI assistant's
+; connection (`flint-indexer mcp`) or a `query`. Windows does not let a
+; running program be overwritten or deleted, but it may be renamed: the
+; old one is moved aside (it keeps running until it ends) and removed
+; when Windows restarts, or by the next install. Copies moved aside by an
+; earlier install are removed first.
+!macro FLINT_FREE_INDEXER
+  Delete "$INSTDIR\flint-indexer.old-*.exe"
+  ${If} ${FileExists} "$INSTDIR\flint-indexer.exe"
+    ClearErrors
+    Delete "$INSTDIR\flint-indexer.exe"
+    ${If} ${Errors}
+      StrCpy $FlintTries 1
+      ${While} ${FileExists} "$INSTDIR\flint-indexer.old-$FlintTries.exe"
+        IntOp $FlintTries $FlintTries + 1
+      ${EndWhile}
+      ClearErrors
+      Rename "$INSTDIR\flint-indexer.exe" "$INSTDIR\flint-indexer.old-$FlintTries.exe"
+      ${IfNot} ${Errors}
+        DetailPrint "flint-indexer.exe was in use; the old copy is removed when Windows restarts"
+        Delete /REBOOTOK "$INSTDIR\flint-indexer.old-$FlintTries.exe"
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+!macroend
+
 !macro NSIS_HOOK_PREINSTALL
   StrCpy $FlintHadService 0
   ReadRegStr $0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
@@ -138,6 +164,7 @@ FunctionEnd
 !macro NSIS_HOOK_POSTINSTALL
   ; the index service's program, built by scripts/prepare-indexer.mjs
   SetOutPath "$INSTDIR"
+  !insertmacro FLINT_FREE_INDEXER
   File "/oname=flint-indexer.exe" "${FLINT_HOOKS_DIR}\bin\flint-indexer.exe"
 
   StrCpy $FlintFull 0
@@ -197,7 +224,7 @@ FunctionEnd
       ; all-users context); not %ALLUSERSPROFILE%, which a user can redefine
       SetShellVarContext all
       RMDir /r "$APPDATA\Flint"
-      Delete "$PROGRAMFILES64\Flint\flint-indexer.exe"
+      Delete /REBOOTOK "$PROGRAMFILES64\Flint\flint-indexer.exe"
       RMDir "$PROGRAMFILES64\Flint"
       nsExec::ExecToStack 'sc.exe query FlintIndexer'
       Pop $0
@@ -212,7 +239,10 @@ FunctionEnd
       ${EndIf}
     ${EndIf}
   ${EndIf}
-  Delete "$INSTDIR\flint-indexer.exe"
+  ; an assistant's connection may still be running it: removed when
+  ; Windows restarts (with what an update moved aside)
+  Delete /REBOOTOK "$INSTDIR\flint-indexer.exe"
+  Delete /REBOOTOK "$INSTDIR\flint-indexer.old-*.exe"
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
