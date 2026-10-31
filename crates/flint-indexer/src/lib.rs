@@ -4,12 +4,14 @@
 //! Pure modules (no OS calls): `usn`, `volindex`, `snapshot` (file I/O only).
 
 pub mod access;
+pub mod ask;
 pub mod cut;
 #[cfg(windows)]
 pub mod engine;
 #[cfg(windows)]
 pub mod folders;
 pub mod log;
+pub mod mcp;
 pub mod ntfs;
 #[cfg(windows)]
 pub mod pipe;

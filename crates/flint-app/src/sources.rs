@@ -137,15 +137,7 @@ pub struct Sources {
     excluded: std::sync::RwLock<Vec<String>>,
 }
 
-/// Merges answers: best score first (ties: shorter path), one hit per path
-/// (paths compare case-insensitively, as on Windows), at most `limit`.
-pub fn merge(mut hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.path.len().cmp(&b.path.len())));
-    let mut seen = std::collections::HashSet::new();
-    hits.retain(|h| seen.insert(h.path.to_lowercase()));
-    hits.truncate(limit);
-    hits
-}
+pub use flint_indexer::ask::merge;
 
 impl Sources {
     pub fn new(
@@ -625,11 +617,11 @@ pub fn start_local(
     skip: Vec<std::path::PathBuf>,
 ) -> Result<Box<dyn Backend>, String> {
     use flint_indexer::engine::{Config, Engine};
-    use flint_indexer::pipe::{current_user_sid, user_pipe_name};
+    use flint_indexer::pipe::current_user_sid;
     let base = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is not set")?;
     let data = std::path::PathBuf::from(base).join("Flint").join(tag);
     let sid = current_user_sid().map_err(|e| e.to_string())?;
-    let pipe = format!("{}-app-{tag}", user_pipe_name(&sid));
+    let pipe = flint_indexer::ask::app_pipe_name(&sid, tag);
     let cfg = Config::user(roots, data, pipe)
         .map_err(|e| e.to_string())?
         .skipping(skip);

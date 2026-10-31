@@ -62,6 +62,73 @@ settings and history.
 Separate words narrow the search, and each word may match a folder in the
 path: `finans butce` finds `…\Finans\…\Bütçe_2026.xlsx`.
 
+## Use from AI assistants (MCP)
+
+`flint-indexer mcp` lets an AI assistant that speaks the Model Context
+Protocol (Hermes Agent, Claude Code, Codex, …) find files by name
+through Flint instead of walking folders. It is installed with Flint;
+nothing else to download.
+
+- One tool, `search`: a name as you would type it in Flint (typos,
+  missing accents, `ext:pdf`, `C:` work as in the app), with an optional
+  limit (20 by default, at most 50), kind (`file` or `folder`) and
+  folder to search under. It returns names, full paths, kind and last
+  change, never file contents; it opens, changes and deletes nothing.
+- No network: the assistant starts the program and talks to it over its
+  standard input and output; it stops when the assistant does. At most
+  60 searches a minute in one session.
+- It sees what the Flint app sees, and only while Flint's index runs
+  (the app, or the service with Full indexing). An index that does not
+  answer within 2 seconds is skipped and the answer says so.
+- Folders in **Settings → Excluded folders** and **Hidden from AI
+  assistants** are never returned, also when they were picked through a
+  junction or link. When Flint's settings cannot be read, the tool shows
+  nothing. These settings limit only what Flint's search returns: an
+  assistant with its own file tools can still open those folders.
+- Invisible and text-direction characters in names are replaced (the
+  result is marked `cleaned`). Visible words in a file name can still
+  try to instruct the assistant, so register Flint as untrusted, as
+  below.
+- **What leaves your PC:** the names and paths a search returns go to
+  the assistant, and from there to the AI provider it uses, like the
+  output of any search the assistant runs. Hidden by default: the
+  folders in your user folder where keys and sign-in data are kept
+  (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`); remove them
+  in Settings if you want. Add any other folder with sensitive names,
+  such as the one holding a password-manager file.
+
+Hermes Agent (`config.yaml`):
+
+```yaml
+mcp_servers:
+  flint:
+    command: 'C:\Program Files\Flint\flint-indexer.exe'
+    args: [mcp]
+    trust: untrusted
+    tools:
+      include: [search]
+      resources: false
+      prompts: false
+```
+
+Claude Code:
+
+```
+claude mcp add --scope user flint -- "C:\Program Files\Flint\flint-indexer.exe" mcp
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.flint]
+command = 'C:\Program Files\Flint\flint-indexer.exe'
+args = ["mcp"]
+```
+
+The server answers both the `initialize` handshake (protocol versions
+2024-11-05 to 2025-11-25) and per-request versions (2026-07-28).
+`flint-indexer query TEXT` prints the same results in a terminal.
+
 ## Privacy
 
 - The index and your open history stay on your PC. Flint sends nothing

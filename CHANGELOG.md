@@ -3,6 +3,26 @@
 All notable changes to Flint are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.6 — 2026-10-31
+
+- AI assistants can search through Flint: `flint-indexer mcp` is a
+  Model Context Protocol server over standard input and output (no
+  network) with one read-only tool, `search`, returning names, paths,
+  kind and last change, never file contents. See "Use from AI
+  assistants" in the README.
+- New setting, **Hidden from AI assistants**: folders the assistants
+  never see, while Flint itself still shows them. It starts with the
+  folders in the user folder that hold keys and sign-in data (`.ssh`,
+  `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`), which can be removed.
+  Excluded folders are hidden from assistants too.
+- `flint-indexer query` searches every running index, as the app does.
+  Before, with Basic mode or the app's own indexers it reported that
+  no indexer was running. It leaves out the folders hidden from
+  assistants, no longer names the indexer that answered, and exits with
+  4 when no index answers and 2 for any other error.
+  Like the MCP server, it gives up on an index that does not answer
+  within 2 seconds, where it waited without end.
+
 ## 0.1.5 — 2026-10-31
 
 - Full indexing no longer leaves memory behind in Windows. To decide
