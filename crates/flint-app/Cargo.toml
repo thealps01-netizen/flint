@@ -1,6 +1,6 @@
 [package]
 name = "flint-app"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "Flint launcher: find a file by part of its name and open it"
 license = "MIT"

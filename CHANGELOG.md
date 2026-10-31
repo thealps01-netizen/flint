@@ -3,6 +3,15 @@
 All notable changes to Flint are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.8 — 2026-10-31
+
+- Updating no longer fails while an AI assistant is connected to Flint
+  (or `flint-indexer query` runs). Windows does not let a running
+  program be overwritten, so the update could not replace
+  `flint-indexer.exe` and left the old one in place. The running copy is
+  now moved aside and removed when Windows restarts, or by the next
+  update; the assistant's connection keeps working until it ends.
+
 ## 0.1.7 — 2026-10-31
 
 - Without the service, the index of your user folder now starts with
