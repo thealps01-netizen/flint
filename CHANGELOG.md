@@ -3,6 +3,13 @@
 All notable changes to Flint are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.7 — 2026-10-31
+
+- Without the service, the index of your user folder now starts with
+  Flint, not at the first search in its window. Before, after a restart
+  AI assistants (and `flint-indexer query`) found nothing in the user
+  folder until the window had been used once.
+
 ## 0.1.6 — 2026-10-31
 
 - AI assistants can search through Flint: `flint-indexer mcp` is a
