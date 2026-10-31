@@ -516,6 +516,11 @@ fn main() {
                     if let (Some(s), Ok(cur)) = (state.sources.get(), state.settings.lock()) {
                         s.set_excluded(settings::exclusion_keys(&cur.excluded_folders));
                     }
+                    // not at the first search: assistants ask the indexers
+                    // without the window ever being opened
+                    if let Some(s) = state.sources.get() {
+                        s.warm_up();
+                    }
                 });
             }
             window::setup(&handle);

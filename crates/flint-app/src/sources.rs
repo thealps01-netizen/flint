@@ -350,6 +350,18 @@ impl Sources {
         })
     }
 
+    /// Starts the indexers a search would start now, so they answer
+    /// assistants (over their pipes) before the window is ever opened:
+    /// the user-folder indexer without the service, what is indexed
+    /// beside it with the service.
+    pub fn warm_up(&self) {
+        if self.service.status().is_ok() {
+            self.beside();
+        } else {
+            self.fallback();
+        }
+    }
+
     /// The service answers steadily: the user-folder indexer is stopped
     /// (it saves on its own thread) and its memory freed; it starts again
     /// if the service goes away.
@@ -694,6 +706,44 @@ mod tests {
 
     fn paths(a: &Answer) -> Vec<&str> {
         a.hits.iter().map(|h| h.path.as_str()).collect()
+    }
+
+    /// Assistants search the app's indexers over their pipes without
+    /// the app's window ever being opened: the one for the user's folder
+    /// must run from the start, not from the first search in the window.
+    #[test]
+    fn warm_up_starts_the_indexers_a_search_would_start() {
+        use std::sync::atomic::AtomicUsize;
+        let made = |n: Arc<AtomicUsize>| -> Factory {
+            Box::new(move || {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Fake::new(Ok(vec![]))) as Box<dyn Backend>)
+            })
+        };
+        // no service: the user-folder indexer
+        let (fallback, beside) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let service = Fake::new(Err(BackendError::Lost("no service".into())));
+        let s = Sources::new(Box::new(service.clone()), vec![], made(fallback.clone()))
+            .beside_service(made(beside.clone()));
+        s.warm_up();
+        s.warm_up();
+        assert_eq!(
+            fallback.load(Ordering::SeqCst),
+            1,
+            "started once, before any search"
+        );
+        assert_eq!(beside.load(Ordering::SeqCst), 0);
+        // with the service: what is indexed beside it, not the fallback
+        let (fallback, beside) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let s = Sources::new(
+            Box::new(Fake::new(Ok(vec![]))),
+            vec![],
+            made(fallback.clone()),
+        )
+        .beside_service(made(beside.clone()));
+        s.warm_up();
+        assert_eq!(fallback.load(Ordering::SeqCst), 0);
+        assert_eq!(beside.load(Ordering::SeqCst), 1);
     }
 
     #[test]
